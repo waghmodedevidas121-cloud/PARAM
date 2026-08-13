@@ -4,9 +4,13 @@ A **Google Colab + Gradio** adaptation of [Jamie Pine Voicebox](https://github.c
 
 This is **not** a standalone Chatterbox demo. The Voicebox `main` branch is the architectural source of truth for engines, model configs, voice profiles, chunking, effects, and capabilities. The Tauri/React desktop frontend is replaced by a Gradio studio that runs on Colab CUDA.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waghmodedevidas121-cloud/PARAM/blob/arena/019ffae2-param/Voicebox_Colab.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waghmodedevidas121-cloud/PARAM/blob/arena%2F019ffae2-param/Voicebox_Colab.ipynb)
 
-**Open `Voicebox_Colab.ipynb` in Colab** (GPU runtime). The notebook clones this repo, installs engines you opt into, and launches the Gradio studio.
+**Open `Voicebox_Colab.ipynb` in Colab** (GPU runtime). The notebook is self-contained — it does **not** clone GitHub — then installs the engines you opt into and launches the Gradio studio.
+
+> This repository is private and the working branch is `arena/019ffae2-param`.
+> GitHub’s contents API must be called with `ref=arena/019ffae2-param` (URL-encoded `arena%2F019ffae2-param`).
+> A request for `contents/019ffae2-param?ref=arena` is a bad split of the branch name and will 404.
 
 ---
 

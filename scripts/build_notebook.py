@@ -3,10 +3,46 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import tarfile
 from pathlib import Path
 
-NB_PATH = Path(__file__).resolve().parents[1] / "Voicebox_Colab.ipynb"
+ROOT = Path(__file__).resolve().parents[1]
+NB_PATH = ROOT / "Voicebox_Colab.ipynb"
+
+
+def _package_b64() -> str:
+    """Embed the Python package so the notebook runs without a GitHub clone.
+
+    The repo is private and the session branch name contains a slash
+    (`arena/019ffae2-param`). GitHub/Colab often split that into
+    ref=`arena` + path=`019ffae2-param`, which 404s. Shipping the
+    package inside the notebook avoids that fetch entirely.
+    """
+    buf = io.BytesIO()
+    include = [
+        "voicebox_colab",
+        "launch.py",
+        "requirements-colab.txt",
+        "LICENSE",
+        "README.md",
+        "pyproject.toml",
+    ]
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in include:
+            path = ROOT / name
+            if path.exists():
+                tar.add(path, arcname=name, filter=_tar_filter)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    name = info.name.replace("\\", "/")
+    if "__pycache__" in name.split("/") or name.endswith(".pyc"):
+        return None
+    return info
 
 
 def md(source: str) -> dict:
@@ -113,23 +149,25 @@ except ImportError:
     md(
         """## 2. Install the Voicebox Colab package
 
-If you opened only the notebook, this clones the repo. If the package is
-already next to the notebook (uploaded folder / Drive mount), it uses that.
+This cell does **not** fetch GitHub. The `voicebox_colab` package is
+embedded in the notebook so a private repo or a slash in the branch name
+(`arena/019ffae2-param`) cannot break setup.
+
+If `voicebox_colab/` is already next to the notebook (full repo upload /
+Drive mount), that copy is used instead.
 """
     ),
     code(
-        r"""import os, sys, subprocess
+        r'''import os, sys, io, tarfile, base64
 from pathlib import Path
 
-REPO_URL = "https://github.com/waghmodedevidas121-cloud/PARAM.git"
-BRANCH = "arena/019ffae2-param"
 ROOT_CANDIDATES = [
     Path.cwd(),
     Path("/content/PARAM"),
-    Path("/content/voicebox-colab"),
+    Path("/content"),
 ]
 
-def find_pkg() -> Path | None:
+def find_pkg():
     for root in ROOT_CANDIDATES:
         if (root / "voicebox_colab" / "ui" / "gradio_app.py").exists():
             return root
@@ -137,25 +175,26 @@ def find_pkg() -> Path | None:
 
 root = find_pkg()
 if root is None:
-    dest = Path("/content/PARAM")
-    print("Package not found next to the notebook — cloning", REPO_URL)
-    if dest.exists():
-        subprocess.check_call(["git", "-C", str(dest), "pull", "--ff-only"])
-    else:
-        try:
-            subprocess.check_call(["git", "clone", "--depth", "1", "-b", BRANCH, REPO_URL, str(dest)])
-        except subprocess.CalledProcessError:
-            subprocess.check_call(["git", "clone", "--depth", "1", REPO_URL, str(dest)])
+    dest = Path("/content/PARAM") if Path("/content").exists() else Path.cwd() / "PARAM"
+    dest.mkdir(parents=True, exist_ok=True)
+    payload = Path("VOICEBOX_COLAB_PKG_B64.txt")
+    # Fallback: the next cell-write is inlined below.
+    b64 = """__PKG_B64__"""
+    raw = base64.b64decode(b64)
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+        tar.extractall(dest)
     root = dest
+    print("Extracted embedded Voicebox Colab package →", root.resolve())
+else:
+    print("Using existing package at", root.resolve())
 
 os.chdir(root)
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
-print("Using package at", root.resolve())
 
 %pip install -q -r requirements-colab.txt
 print("Core dependencies installed.")
-"""
+'''
     ),
     md(
         """## 3. Optional engine installs
@@ -318,5 +357,20 @@ nb = {
     "cells": cells,
 }
 
+pkg_b64 = _package_b64()
+for cell in cells:
+    if cell["cell_type"] != "code":
+        continue
+    text = "".join(cell["source"])
+    if "__PKG_B64__" not in text:
+        continue
+    text = text.replace("__PKG_B64__", pkg_b64)
+    cell["source"] = [ln + "\n" for ln in text.split("\n")]
+    if cell["source"] and cell["source"][-1] == "\n":
+        cell["source"].pop()
+    break
+else:
+    raise SystemExit("bootstrap cell missing __PKG_B64__ placeholder")
+
 NB_PATH.write_text(json.dumps(nb, indent=1), encoding="utf-8")
-print("wrote", NB_PATH, "cells=", len(cells))
+print("wrote", NB_PATH, "cells=", len(cells), "embedded_pkg_chars=", len(pkg_b64))
