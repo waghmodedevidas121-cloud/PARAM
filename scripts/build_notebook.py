@@ -192,7 +192,8 @@ os.chdir(root)
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
-%pip install -q -r requirements-colab.txt
+import subprocess
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements-colab.txt"])
 print("Core dependencies installed.")
 '''
     ),
@@ -212,28 +213,66 @@ Recommended on a free T4:
     ),
     md("### 3a. Kokoro 82M (recommended first)"),
     code(
-        """%pip install -q "kokoro>=0.9.4" "misaki[en,ja,zh]>=0.9.4" unidic-lite
-%pip install -q https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+        """import subprocess, sys
+
+def pip_install(*args):
+    cmd = [sys.executable, "-m", "pip", "install", "-q", *args]
+    print(" ".join(cmd))
+    subprocess.check_call(cmd)
+
+pip_install("kokoro>=0.9.4", "misaki[en,ja,zh]>=0.9.4", "unidic-lite")
+pip_install(
+    "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+)
 print("Kokoro install finished.")
 """
     ),
     md(
         """### 3b. Chatterbox Multilingual + Turbo
 
-Voicebox installs `chatterbox-tts` with `--no-deps` because the package
-pins old `numpy` / `torch`. Same recipe here.
+Voicebox installs `chatterbox-tts` with `--no-deps` because upstream pins
+old `numpy` / `torch`. Same recipe here.
+
+Do **not** use a `\\` line continuation with `%pip` — Colab treats the next
+line as Python and the install dies. These cells call `python -m pip`
+with a real argument list.
 """
     ),
     code(
-        """%pip install -q --no-deps chatterbox-tts
-%pip install -q "conformer>=0.3.2" "diffusers>=0.29.0" omegaconf pykakasi \\
-    "resemble-perth>=1.0.1" s3tokenizer spacy-pkuseg pyloudnorm
+        """import subprocess, sys
+
+def pip_install(*args):
+    cmd = [sys.executable, "-m", "pip", "install", "-q", *args]
+    print(" ".join(cmd))
+    subprocess.check_call(cmd)
+
+# Package itself — skip its broken pins.
+pip_install("--no-deps", "chatterbox-tts")
+
+# Sub-deps from Voicebox backend/requirements.txt (do not pin torch/numpy).
+pip_install(
+    "conformer>=0.3.2",
+    "diffusers>=0.29.0",
+    "omegaconf",
+    "pykakasi",
+    "resemble-perth>=1.0.1",
+    "s3tokenizer",
+    "spacy-pkuseg",
+    "pyloudnorm",
+)
 print("Chatterbox install finished.")
 """
     ),
     md("### 3c. Qwen3-TTS Base + CustomVoice"),
     code(
-        """%pip install -q "qwen-tts>=0.0.5"
+        """import subprocess, sys
+
+def pip_install(*args):
+    cmd = [sys.executable, "-m", "pip", "install", "-q", *args]
+    print(" ".join(cmd))
+    subprocess.check_call(cmd)
+
+pip_install("qwen-tts>=0.0.5")
 print("qwen-tts install finished.")
 """
     ),
@@ -246,11 +285,21 @@ images; if it does, skip LuxTTS. The studio still runs.
 """
     ),
     code(
-        """import traceback
+        """import subprocess, sys, traceback
+
+def pip_install(*args):
+    cmd = [sys.executable, "-m", "pip", "install", "-q", *args]
+    print(" ".join(cmd))
+    subprocess.check_call(cmd)
+
 try:
-    %pip install -q --find-links https://k2-fsa.github.io/icefall/piper_phonemize.html piper-phonemize
-    %pip install -q "linacodec @ git+https://github.com/ysharma3501/LinaCodec.git"
-    %pip install -q "Zipvoice @ git+https://github.com/ysharma3501/LuxTTS.git"
+    pip_install(
+        "--find-links",
+        "https://k2-fsa.github.io/icefall/piper_phonemize.html",
+        "piper-phonemize",
+    )
+    pip_install("linacodec @ git+https://github.com/ysharma3501/LinaCodec.git")
+    pip_install("Zipvoice @ git+https://github.com/ysharma3501/LuxTTS.git")
     print("LuxTTS install finished.")
 except Exception:
     traceback.print_exc()
@@ -265,10 +314,16 @@ shim (`backend/utils/dac_shim.py`, also ported here). TADA 3B wants ~8 GB.
 """
     ),
     code(
-        """import traceback
+        """import subprocess, sys, traceback
+
+def pip_install(*args):
+    cmd = [sys.executable, "-m", "pip", "install", "-q", *args]
+    print(" ".join(cmd))
+    subprocess.check_call(cmd)
+
 try:
-    %pip install -q --no-deps hume-tada
-    %pip install -q torchaudio
+    pip_install("--no-deps", "hume-tada")
+    pip_install("torchaudio")
     print("TADA install finished. First load will download codec + weights + ungated Llama tokenizer.")
 except Exception:
     traceback.print_exc()
