@@ -166,8 +166,9 @@ def generate(
             "MPLBACKEND": "Agg",
             "PYTHONUNBUFFERED": "1",
             "TOKENIZERS_PARALLELISM": "false",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         })
+        # Torch 2.0 in SadTalker rejects the newer expandable_segments option.
+        env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
         try:
             progress(0.03, desc="Preparing inputs…")
@@ -225,8 +226,11 @@ def generate(
                     ]
                     if deepcache:
                         latent_command.append("--enable_deepcache")
+                    latent_env = env.copy()
+                    # Supported by LatentSync's Torch 2.5, but not SadTalker's Torch 2.0.
+                    latent_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
                     stage_start = time.perf_counter()
-                    code = stream_process(latent_command, LATENT_ROOT, env, log)
+                    code = stream_process(latent_command, LATENT_ROOT, latent_env, log)
                     latent_seconds = time.perf_counter() - stage_start
                     if code:
                         raise RuntimeError(f"LatentSync exited with code {code}")
