@@ -6,9 +6,19 @@ Google Colab notebooks with browser-based Gradio interfaces for open AI media wo
 
 | Studio | What it does | Runtime | Open |
 |---|---|---|---|
+| **SadTalker + LatentSync 1.5** | Creates head/eye/expression motion from one photo, then performs a high-accuracy LatentSync lip/teeth refinement pass. Also includes each engine as a standalone mode. | Colab T4 / L4 / A100 | [![Open SadTalker + LatentSync in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waghmodedevidas121-cloud/PARAM/blob/main/SadTalker_LatentSync_Colab_Gradio.ipynb) |
 | **OmniAvatar 1.3B Studio** | Generatively creates new facial, head, hand, and body motion from a photo, speech, and behavior prompt. Low-VRAM T4 profile; very slow and 16–24 GB system RAM recommended. | Colab T4 / L4 / A100 | [![Open OmniAvatar in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waghmodedevidas121-cloud/PARAM/blob/main/OmniAvatar_1_3B_T4_Colab_Gradio.ipynb) |
 | **Open Avatar Studio — Video Twin** | Uses a 2–20 second authorized motion-reference video plus new speech to preserve full-frame body/hand/background motion while generating new facial speech motion. Photo mode is also included. | Colab T4 / L4 / A100 | [![Open Avatar Studio in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waghmodedevidas121-cloud/PARAM/blob/main/Ditto_Avatar_Colab_Gradio.ipynb) |
 | **Voicebox Colab** | Multi-engine text-to-speech and voice studio with a Gradio UI. | Colab GPU recommended | [![Open Voicebox in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/waghmodedevidas121-cloud/PARAM/blob/main/019ffae2-param/Voicebox_Colab.ipynb) |
+
+## Fast photo-to-avatar workflow
+
+1. Open `SadTalker_LatentSync_Colab_Gradio.ipynb` on a T4 GPU.
+2. Upload a front-facing portrait and clean speech audio.
+3. SadTalker generates head/eye/expression motion; LatentSync 1.5 refines the final mouth and teeth synchronization.
+4. Use SadTalker-only for a fast draft or LatentSync-only to re-dub an existing video.
+
+This pipeline is faster than full-frame video diffusion and needs about 8 GB VRAM for its LatentSync stage. It does not generate new hand/body gestures.
 
 ## Generative OmniAvatar workflow
 
