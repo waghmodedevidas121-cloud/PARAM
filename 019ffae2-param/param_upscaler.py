@@ -73,6 +73,15 @@ MODEL_LABELS = {
     "anime": "RealESRGAN_x4plus_anime_6B",
 }
 
+VIDEO2X_VERSION = "6.4.0"
+VIDEO2X_APPIMAGE_URL = (
+    "https://github.com/k4yt3x/video2x/releases/download/"
+    f"{VIDEO2X_VERSION}/Video2X-x86_64.AppImage"
+)
+VIDEO2X_DIR = ROOT / "video2x"
+VIDEO2X_APPIMAGE = VIDEO2X_DIR / f"Video2X-{VIDEO2X_VERSION}.AppImage"
+_VIDEO2X_RUNTIME: Optional[tuple[list[str], Path, dict[str, str]]] = None
+
 
 def _model_label(model_key: str) -> str:
     return MODEL_LABELS.get(model_key, model_key)
@@ -195,6 +204,103 @@ def _download_asset(kind: str) -> Path:
             f"Could not download {spec['filename']}. Check the Colab internet connection and try again."
         ) from None
     return destination
+
+
+def _download_video2x_appimage(progress: ProgressFn = None) -> Path:
+    """Download the official Linux Video2X bundle once per Colab runtime."""
+
+    VIDEO2X_DIR.mkdir(parents=True, exist_ok=True)
+    if VIDEO2X_APPIMAGE.exists() and VIDEO2X_APPIMAGE.stat().st_size > 150_000_000:
+        return VIDEO2X_APPIMAGE
+
+    partial = VIDEO2X_APPIMAGE.with_suffix(VIDEO2X_APPIMAGE.suffix + ".part")
+    partial.unlink(missing_ok=True)
+    _report(progress, 0.02, "Downloading Video2X 6.4.0 (first video run only)")
+    request = Request(VIDEO2X_APPIMAGE_URL, headers={"User-Agent": "PARAM-Colab-Upscaler/1.0"})
+    try:
+        with urlopen(request, timeout=180) as response, partial.open("wb") as handle:
+            shutil.copyfileobj(response, handle, length=4 * 1024 * 1024)
+        if partial.stat().st_size <= 150_000_000:
+            raise RuntimeError("Video2X AppImage download is unexpectedly small")
+        partial.replace(VIDEO2X_APPIMAGE)
+        VIDEO2X_APPIMAGE.chmod(VIDEO2X_APPIMAGE.stat().st_mode | 0o111)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Could not download the Video2X Linux AppImage. Check the Colab internet connection and retry."
+        ) from None
+    return VIDEO2X_APPIMAGE
+
+
+def _probe_video2x(command: list[str], cwd: Path, env: dict[str, str]) -> bool:
+    try:
+        result = subprocess.run(
+            command + ["--version"],
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "video2x" in result.stdout.lower()
+
+
+def prepare_video2x(progress: ProgressFn = None) -> str:
+    """Prepare the official Video2X AppImage and return a runnable command.
+
+    Video2X 6 is a C++/Vulkan application. The AppImage contains its ncnn
+    models and libraries, while Colab supplies the NVIDIA Vulkan driver.
+    """
+
+    global _VIDEO2X_RUNTIME
+    if _VIDEO2X_RUNTIME is not None:
+        return " ".join(_VIDEO2X_RUNTIME[0])
+
+    appimage = _download_video2x_appimage(progress)
+    appimage.chmod(appimage.stat().st_mode | 0o111)
+    env = os.environ.copy()
+    direct_command = [str(appimage), "--appimage-extract-and-run"]
+    if _probe_video2x(direct_command, VIDEO2X_DIR, env):
+        _VIDEO2X_RUNTIME = (direct_command, VIDEO2X_DIR, env)
+        _report(progress, 0.12, "Video2X Vulkan backend ready")
+        return " ".join(direct_command)
+
+    # FUSE is not available in some Colab runtimes. Extracting the AppImage
+    # uses the same bundled binary without requiring a FUSE mount.
+    extracted = VIDEO2X_DIR / "squashfs-root"
+    if not extracted.exists():
+        result = subprocess.run(
+            [str(appimage), "--appimage-extract"],
+            cwd=str(VIDEO2X_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if result.returncode != 0 or not extracted.exists():
+            raise RuntimeError(
+                "Video2X AppImage could not start in this Colab runtime. "
+                "Try Runtime → Factory reset runtime and run the setup cells again."
+            )
+    runner = extracted / "AppRun"
+    if not runner.exists():
+        candidates = [p for p in extracted.rglob("video2x") if p.is_file() and os.access(p, os.X_OK)]
+        if not candidates:
+            raise RuntimeError("Video2X executable was not found inside the AppImage.")
+        runner = candidates[0]
+    env["APPDIR"] = str(extracted)
+    command = [str(runner)]
+    if not _probe_video2x(command, extracted, env):
+        raise RuntimeError("Video2X started, but its Vulkan CLI probe failed.")
+    _VIDEO2X_RUNTIME = (command, extracted, env)
+    _report(progress, 0.12, "Video2X Vulkan backend ready (extracted AppImage)")
+    return " ".join(command)
 
 
 def resolve_model(mode: Any) -> str:
@@ -599,6 +705,77 @@ def _mux_video_audio(raw_video: Path, source: Path, destination: Path) -> bool:
     return True
 
 
+def _video2x_model_name(scale: int, mode: Any) -> str:
+    """Choose a model bundled with Video2X 6 for the requested output."""
+
+    # Video2X ships x2/x3/x4 AnimeVideoV3 assets. It is the only bundled
+    # Video2X Real-ESRGAN family with a native x2 model.
+    if scale == 2 or resolve_model(mode) == "anime":
+        return "realesr-animevideov3"
+    return "realesrgan-plus"
+
+
+def _run_video2x(
+    source: Path,
+    destination: Path,
+    scale: int,
+    model_mode: Any,
+    progress: ProgressFn = None,
+) -> str:
+    """Run Video2X 6's C++/Vulkan pipeline and return the model label."""
+
+    prepare_video2x(progress)
+    assert _VIDEO2X_RUNTIME is not None
+    runner, cwd, env = _VIDEO2X_RUNTIME
+    model_name = _video2x_model_name(scale, model_mode)
+    command = [
+        *runner,
+        "-i",
+        str(source),
+        "-o",
+        str(destination),
+        "-p",
+        "realesrgan",
+        "-s",
+        str(scale),
+        "--realesrgan-model",
+        model_name,
+        "-d",
+        "0",
+        "--no-progress",
+        "-c",
+        "libx264",
+        "-e",
+        "crf=18",
+        "-e",
+        "preset=medium",
+    ]
+    _report(progress, 0.15, f"Video2X Vulkan running ({model_name}, 2x/4x)")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        output, _ = process.communicate()
+    except OSError as error:
+        raise RuntimeError(f"Could not start Video2X: {error}") from error
+
+    _report(progress, 0.95, "Video2X encoding output")
+    if process.returncode != 0 or not destination.exists() or destination.stat().st_size == 0:
+        details = "\n".join((output or "").splitlines()[-8:])
+        raise RuntimeError(
+            "Video2X failed. Confirm that Colab exposes a Vulkan GPU (the T4 should appear as device 0).\n"
+            + details
+        )
+    _report(progress, 1.0, "Video2X finished")
+    return model_name
+
+
 def upscale_video(
     input_file: Any,
     scale_choice: Any = "2x",
@@ -607,99 +784,36 @@ def upscale_video(
     tile_size: Any = 512,
     progress: ProgressFn = None,
 ) -> tuple[str, str]:
-    """Gradio callback for videos; frames are processed sequentially to cap VRAM."""
+    """Gradio callback for videos using Video2X 6's native Vulkan pipeline."""
 
     source = _as_path(input_file)
     if source is None:
         raise ValueError("Upload a video first.")
     if source.suffix.lower() not in VIDEO_EXTENSIONS:
         raise ValueError(f"Unsupported video type: {source.suffix or 'unknown'}")
+    if face_enhance:
+        raise ValueError("GFPGAN is not used by Video2X. Turn off face restoration for the fast Video2X path.")
     scale = _scale_value(scale_choice)
-    tile = _tile_value(tile_size)
+    _tile_value(tile_size)  # Kept in the shared UI; Video2X chooses its own Vulkan tile size.
 
+    # Read metadata only for a useful status message; Video2X owns decoding,
+    # frame processing, audio copying, and final encoding.
     cap = cv2.VideoCapture(str(source))
-    if not cap.isOpened():
-        raise ValueError("Could not open this video. Try MP4 or re-encode the source first.")
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
     if width <= 0 or height <= 0:
-        cap.release()
-        raise ValueError("The video has no readable frames.")
-    if not math.isfinite(fps) or fps <= 0:
-        fps = 30.0
-    target_width, target_height = width * scale, height * scale
-    # A whole 720p/1080p frame is faster than dozens of tiny sequential tiles.
-    # If it does not fit, enhance_bgr automatically retries with safe tiles.
-    video_tile = 0 if tile >= 512 and width * height <= 2_500_000 else tile
-    if video_tile == 0:
-        print(f"[PARAM] Video full-frame mode for {width}×{height}; CUDA OOM will fall back to tiles")
+        raise ValueError("Could not read the video dimensions. Try MP4 or re-encode the source first.")
+
     destination = _output_path(source, scale, ".mp4")
-    work_dir = Path(tempfile.mkdtemp(prefix="param_upscale_", dir=str(ROOT)))
-    raw_video = work_dir / "silent_upscaled.mp4"
-    writer = None
-    frame_index = 0
-    model_key = resolve_model(model_mode)
-    used_tile = video_tile
-
-    try:
-        writer = cv2.VideoWriter(
-            str(raw_video),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (target_width, target_height),
-        )
-        if not writer.isOpened():
-            raise RuntimeError("Could not create the temporary output video.")
-
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if frame_index == 0:
-                _report(progress, 0.02, "Loading AI model (first run downloads the checkpoint)")
-            output, model_key, used_tile = enhance_bgr(
-                frame,
-                scale,
-                model_mode,
-                video_tile,
-                bool(face_enhance),
-            )
-            output = _resize_to_target(output, target_width, target_height)
-            writer.write(output)
-            frame_index += 1
-            if total > 0:
-                fraction = 0.05 + 0.88 * (frame_index / total)
-                _report(progress, fraction, f"Upscaling frame {frame_index}/{total}")
-            elif frame_index % 5 == 0:
-                _report(progress, 0.5, f"Upscaling frame {frame_index}")
-
-        if writer is not None:
-            writer.release()
-            writer = None
-        cap.release()
-        if frame_index == 0:
-            raise ValueError("No frames could be read from this video.")
-
-        _report(progress, 0.95, "Encoding MP4 and preserving audio")
-        audio_preserved = _mux_video_audio(raw_video, source, destination)
-        extras = " + GFPGAN face restoration" if face_enhance else ""
-        audio_note = "audio preserved" if audio_preserved else "audio unavailable"
-        device = _device()
-        device_text = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
-        status = (
-            f"✅ **Done:** `{source.name}` · {width}×{height} → {target_width}×{target_height} · "
-            f"{scale}x · {frame_index} frames · {_model_label(model_key)}{extras} · {audio_note} · {device_text}"
-        )
-        _report(progress, 1.0, "Finished")
-        return str(destination), status
-    finally:
-        if writer is not None:
-            writer.release()
-        cap.release()
-        shutil.rmtree(work_dir, ignore_errors=True)
-
+    model_name = _run_video2x(source, destination, scale, model_mode, progress)
+    frame_text = f" · {total} frames" if total > 0 else ""
+    status = (
+        f"✅ **Done:** `{source.name}` · {width}×{height} → {width * scale}×{height * scale} · "
+        f"{scale}x · Video2X {VIDEO2X_VERSION} · {model_name} · Vulkan GPU 0{frame_text} · audio preserved"
+    )
+    return str(destination), status
 
 def build_app() -> Any:
     """Build the Gradio interface without launching it."""
@@ -714,13 +828,13 @@ def build_app() -> Any:
     with gr.Blocks(css=css, title="PARAM AI Upscaler") as demo:
         gr.Markdown("# PARAM AI Upscaler", elem_classes=["param-title"])
         gr.Markdown(
-            "T4-friendly image and video enhancement · Real-ESRGAN + optional GFPGAN",
+            "T4-friendly image enhancement · Video2X Vulkan video processing · optional GFPGAN faces",
             elem_classes=["param-subtitle"],
         )
         gr.Markdown(
             f"**Runtime:** {system_info()}\n\n"
-            "Auto mode uses the safer photo model. Choose Anime / illustration for cartoons or line art. "
-            "Large videos can take time on a free Colab session."
+            "Images use the Python Real-ESRGAN path. Videos use Video2X 6.4.0 with ncnn/Vulkan and its bundled models. "
+            "Auto is the safe photo choice; choose Anime / illustration for cartoons or line art."
         )
 
         with gr.Row():
@@ -741,8 +855,8 @@ def build_app() -> Any:
                     maximum=1024,
                     value=512,
                     step=128,
-                    label="Tile size (T4 speed / VRAM)",
-                    info="512 is the safe default; try 1024 for speed. Lower to 256 or 128 if CUDA runs out of memory.",
+                    label="Tile size (image path)",
+                    info="Used by image Real-ESRGAN. Video2X selects its own Vulkan tile size automatically.",
                 )
 
         with gr.Tab("Image"):
@@ -765,8 +879,9 @@ def build_app() -> Any:
             video_output = gr.Video(label="Upscaled MP4")
             video_status = gr.Markdown()
             gr.Markdown(
-                "For real-world **2x video**, Auto uses the native `RealESRGAN_x2plus` model. "
-                "Frames are processed sequentially to stay inside T4 VRAM; keep the Colab tab open until the output appears."
+                f"Video is processed by **Video2X {VIDEO2X_VERSION}** using its C++/Vulkan pipeline. "
+                "For 2x, the bundled `realesr-animevideov3-x2` model is used; for real-world 4x, `realesrgan-plus-x4`. "
+                "Keep the Colab tab open until the output appears."
             )
 
         # Defining the progress default inside build_app keeps gradio optional
