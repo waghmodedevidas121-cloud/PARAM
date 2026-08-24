@@ -694,4 +694,5 @@ def build_app() -> Any:
 
 
 if __name__ == "__main__":
-    build_app().launch(share=True, server_name="0.0.0.0", server_port=7860)
+    # Let Gradio choose the first free port (important when a Colab cell is rerun).
+    build_app().launch(share=True, server_name="0.0.0.0")
