@@ -189,8 +189,30 @@ def _ensure_source_package_compat() -> None:
     """
 
     source_specs = (
-        (Path("/content/Real-ESRGAN"), "realesrgan", "0.3.0", "from .utils import RealESRGANer\n"),
-        (Path("/content/BasicSR"), "basicsr", "1.4.2", "from .version import __gitsha__, __version__\n"),
+        (
+            Path("/content/Real-ESRGAN"),
+            "realesrgan",
+            "0.3.0",
+            "from .utils import RealESRGANer\n",
+        ),
+        (
+            Path("/content/BasicSR"),
+            "basicsr",
+            "1.4.2",
+            "from .version import __gitsha__, __version__\n",
+        ),
+        (
+            Path("/content/facexlib"),
+            "facexlib",
+            "0.3.0",
+            "from .detection import *\nfrom .parsing import *\nfrom .utils import *\nfrom .version import __gitsha__, __version__\n",
+        ),
+        (
+            Path("/content/GFPGAN"),
+            "gfpgan",
+            "1.3.8",
+            "from .utils import GFPGANer\n",
+        ),
     )
     for root, package_name, version, lightweight_init in source_specs:
         package_dir = root / package_name
@@ -203,11 +225,10 @@ def _ensure_source_package_compat() -> None:
                 encoding="utf-8",
             )
         init_file = package_dir / "__init__.py"
-        if package_name == "realesrgan" and init_file.exists():
-            # The upstream init eagerly imports training registries and needs
-            # packages that are irrelevant to inference on a free T4.
-            init_file.write_text(lightweight_init, encoding="utf-8")
-        elif package_name == "basicsr" and init_file.exists():
+        if package_name in {"realesrgan", "basicsr", "facexlib", "gfpgan"} and init_file.exists():
+            # The upstream inits eagerly import training/registry modules and
+            # their generated version metadata. Only inference APIs are needed
+            # here, so keep the source-only package imports lightweight.
             init_file.write_text(lightweight_init, encoding="utf-8")
 
 
