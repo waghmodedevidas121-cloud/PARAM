@@ -67,6 +67,17 @@ MODEL_SPECS = {
     },
 }
 
+MODEL_LABELS = {
+    "photo": "RealESRGAN_x4plus",
+    "photo_x2": "RealESRGAN_x2plus",
+    "anime": "RealESRGAN_x4plus_anime_6B",
+}
+
+
+def _model_label(model_key: str) -> str:
+    return MODEL_LABELS.get(model_key, model_key)
+
+
 ProgressFn = Optional[Callable[..., Any]]
 _UPSAMPLER_CACHE: dict[tuple[str, int, str, bool], Any] = {}
 _FACE_CACHE: dict[tuple[str, int, str, bool], Any] = {}
@@ -353,7 +364,7 @@ def get_upsampler(
     actual_device = next(upsampler.model.parameters()).device
     if actual_device.type != "cuda":
         raise RuntimeError(f"Real-ESRGAN loaded on {actual_device}, not on the T4 CUDA device.")
-    print(f"[PARAM] Using {actual_device} · FP16={half} · {model_key} model · tile={tile}")
+    print(f"[PARAM] Using {actual_device} · FP16={half} · {_model_label(model_key)} · tile={tile}")
     _UPSAMPLER_CACHE[cache_key] = upsampler
     return upsampler, model_key
 
@@ -507,7 +518,7 @@ def _status_text(
     extras = " + GFPGAN face restoration" if face_enhance else ""
     return (
         f"✅ **Done:** `{source.name}` · {before_w}×{before_h} → {after_w}×{after_h} · "
-        f"{scale}x · {model_key} model{extras} · tile {tile} · {device_text}"
+        f"{scale}x · {_model_label(model_key)}{extras} · tile {tile} · {device_text}"
     )
 
 
@@ -679,7 +690,7 @@ def upscale_video(
         device_text = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
         status = (
             f"✅ **Done:** `{source.name}` · {width}×{height} → {target_width}×{target_height} · "
-            f"{scale}x · {frame_index} frames · {model_key} model{extras} · {audio_note} · {device_text}"
+            f"{scale}x · {frame_index} frames · {_model_label(model_key)}{extras} · {audio_note} · {device_text}"
         )
         _report(progress, 1.0, "Finished")
         return str(destination), status
@@ -754,8 +765,8 @@ def build_app() -> Any:
             video_output = gr.Video(label="Upscaled MP4")
             video_status = gr.Markdown()
             gr.Markdown(
-                "Video frames are processed sequentially to stay inside T4 VRAM. "
-                "Keep the Colab tab open until the output appears."
+                "For real-world **2x video**, Auto uses the native `RealESRGAN_x2plus` model. "
+                "Frames are processed sequentially to stay inside T4 VRAM; keep the Colab tab open until the output appears."
             )
 
         # Defining the progress default inside build_app keeps gradio optional
