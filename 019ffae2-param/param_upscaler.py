@@ -629,7 +629,6 @@ def build_app() -> Any:
             video_input = gr.Video(
                 label="Upload video",
                 sources=["upload"],
-                type="filepath",
             )
             video_button = gr.Button("Upscale video", variant="primary")
             video_output = gr.Video(label="Upscaled MP4")
