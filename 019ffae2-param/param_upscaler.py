@@ -24,6 +24,15 @@ import cv2
 import numpy as np
 import torch
 
+# T4-friendly inference defaults. cuDNN benchmarking avoids repeatedly
+# selecting kernels for the same tile shape across video frames.
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+
 
 # Colab has /content; the fallback makes the source file harmless to import in
 # a normal local checkout as well.
@@ -267,7 +276,7 @@ def _rrdb_model(model_key: str) -> Any:
     )
 
 
-def get_upsampler(mode: Any = "Auto (recommended)", tile_size: Any = 256) -> tuple[Any, str]:
+def get_upsampler(mode: Any = "Auto (recommended)", tile_size: Any = 512) -> tuple[Any, str]:
     """Load and cache a Real-ESRGAN upsampler, returning it and its model key."""
 
     _ensure_torchvision_compat()
@@ -305,7 +314,7 @@ def get_upsampler(mode: Any = "Auto (recommended)", tile_size: Any = 256) -> tup
     return upsampler, model_key
 
 
-def get_face_enhancer(mode: Any = "Auto (recommended)", tile_size: Any = 256) -> Any:
+def get_face_enhancer(mode: Any = "Auto (recommended)", tile_size: Any = 512) -> Any:
     """Load GFPGAN once, using the same tiled background upsampler."""
 
     _ensure_torchvision_compat()
@@ -393,7 +402,7 @@ def enhance_bgr(
     image: np.ndarray,
     scale: int,
     mode: Any = "Auto (recommended)",
-    tile_size: Any = 256,
+    tile_size: Any = 512,
     face_enhance: bool = False,
 ) -> tuple[np.ndarray, str, int]:
     """Upscale one BGR image, retrying with a smaller tile after a CUDA OOM."""
@@ -454,7 +463,7 @@ def upscale_image(
     scale_choice: Any = "4x",
     model_mode: Any = "Auto (recommended)",
     face_enhance: bool = False,
-    tile_size: Any = 256,
+    tile_size: Any = 512,
     progress: ProgressFn = None,
 ) -> tuple[str, str]:
     """Gradio callback for images."""
@@ -531,7 +540,7 @@ def upscale_video(
     scale_choice: Any = "2x",
     model_mode: Any = "Auto (recommended)",
     face_enhance: bool = False,
-    tile_size: Any = 256,
+    tile_size: Any = 512,
     progress: ProgressFn = None,
 ) -> tuple[str, str]:
     """Gradio callback for videos; frames are processed sequentially to cap VRAM."""
@@ -661,10 +670,10 @@ def build_app() -> Any:
                 tile = gr.Slider(
                     minimum=128,
                     maximum=512,
-                    value=256,
+                    value=512,
                     step=64,
-                    label="Tile size (T4 VRAM safety)",
-                    info="256 is the recommended free-T4 setting. Lower it if CUDA runs out of memory.",
+                    label="Tile size (T4 speed / VRAM)",
+                    info="512 is faster on a 16 GB T4. Lower to 256 or 128 if CUDA runs out of memory.",
                 )
 
         with gr.Tab("Image"):
