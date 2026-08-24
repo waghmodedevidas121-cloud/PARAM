@@ -69,7 +69,22 @@ _FACE_CACHE: dict[tuple[str, int, str, bool], Any] = {}
 
 
 def _device() -> torch.device:
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        # Colab's first visible GPU is the T4 target. Selecting it explicitly
+        # prevents a stale/default device setting from silently falling back.
+        torch.cuda.set_device(0)
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+def _require_cuda() -> torch.device:
+    device = _device()
+    if device.type != "cuda":
+        raise RuntimeError(
+            "CUDA GPU is not available. In Colab choose Runtime → Change runtime type → T4 GPU, "
+            "then restart the runtime and run the notebook again."
+        )
+    return device
 
 
 def system_info() -> str:
@@ -284,7 +299,7 @@ def get_upsampler(mode: Any = "Auto (recommended)", tile_size: Any = 512) -> tup
 
     model_key = resolve_model(mode)
     tile = _tile_value(tile_size)
-    device = _device()
+    device = _require_cuda()
     half = device.type == "cuda"
     cache_key = (model_key, tile, str(device), half)
     if cache_key in _UPSAMPLER_CACHE:
@@ -310,6 +325,10 @@ def get_upsampler(mode: Any = "Auto (recommended)", tile_size: Any = 512) -> tup
         # Compatibility with older Real-ESRGAN wheels whose constructor did
         # not expose the device keyword.
         upsampler = RealESRGANer(**kwargs)
+    actual_device = next(upsampler.model.parameters()).device
+    if actual_device.type != "cuda":
+        raise RuntimeError(f"Real-ESRGAN loaded on {actual_device}, not on the T4 CUDA device.")
+    print(f"[PARAM] Using {actual_device} · FP16={half} · {model_key} model · tile={tile}")
     _UPSAMPLER_CACHE[cache_key] = upsampler
     return upsampler, model_key
 
@@ -407,6 +426,7 @@ def enhance_bgr(
 ) -> tuple[np.ndarray, str, int]:
     """Upscale one BGR image, retrying with a smaller tile after a CUDA OOM."""
 
+    _require_cuda()
     if image is None or image.size == 0:
         raise ValueError("Input image is empty.")
     scale = _scale_value(scale)
@@ -669,11 +689,11 @@ def build_app() -> Any:
                 )
                 tile = gr.Slider(
                     minimum=128,
-                    maximum=512,
+                    maximum=1024,
                     value=512,
-                    step=64,
+                    step=128,
                     label="Tile size (T4 speed / VRAM)",
-                    info="512 is faster on a 16 GB T4. Lower to 256 or 128 if CUDA runs out of memory.",
+                    info="512 is the safe default; try 1024 for speed. Lower to 256 or 128 if CUDA runs out of memory.",
                 )
 
         with gr.Tab("Image"):
