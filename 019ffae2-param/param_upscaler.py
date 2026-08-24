@@ -53,6 +53,10 @@ MODEL_SPECS = {
         "filename": "RealESRGAN_x4plus.pth",
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
     },
+    "photo_x2": {
+        "filename": "RealESRGAN_x2plus.pth",
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+    },
     "anime": {
         "filename": "RealESRGAN_x4plus_anime_6B.pth",
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
@@ -281,6 +285,15 @@ def _rrdb_model(model_key: str) -> Any:
             num_grow_ch=32,
             scale=4,
         )
+    if model_key == "photo_x2":
+        return RRDBNet(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=23,
+            num_grow_ch=32,
+            scale=2,
+        )
     return RRDBNet(
         num_in_ch=3,
         num_out_ch=3,
@@ -291,13 +304,25 @@ def _rrdb_model(model_key: str) -> Any:
     )
 
 
-def get_upsampler(mode: Any = "Auto (recommended)", tile_size: Any = 512) -> tuple[Any, str]:
-    """Load and cache a Real-ESRGAN upsampler, returning it and its model key."""
+def get_upsampler(
+    mode: Any = "Auto (recommended)",
+    tile_size: Any = 512,
+    model_scale: Any = 4,
+) -> tuple[Any, str]:
+    """Load and cache a Real-ESRGAN upsampler, returning it and its model key.
+
+    Real photos requested at 2x use the native x2 checkpoint instead of
+    computing a 4x image and shrinking it. This is a substantial speed and
+    memory win for the common 2x video setting.
+    """
 
     _ensure_torchvision_compat()
     from realesrgan import RealESRGANer
 
-    model_key = resolve_model(mode)
+    base_model_key = resolve_model(mode)
+    requested_scale = _scale_value(model_scale)
+    model_key = "photo_x2" if base_model_key == "photo" and requested_scale == 2 else base_model_key
+    native_scale = 2 if model_key == "photo_x2" else 4
     tile = _tile_value(tile_size)
     device = _require_cuda()
     half = device.type == "cuda"
@@ -311,7 +336,7 @@ def get_upsampler(mode: Any = "Auto (recommended)", tile_size: Any = 512) -> tup
     checkpoint = _download_asset(model_key)
     model = _rrdb_model(model_key)
     kwargs = dict(
-        scale=4,
+        scale=native_scale,
         model_path=str(checkpoint),
         model=model,
         tile=tile,
@@ -339,7 +364,9 @@ def get_face_enhancer(mode: Any = "Auto (recommended)", tile_size: Any = 512) ->
     _ensure_torchvision_compat()
     from gfpgan import GFPGANer
 
-    upsampler, model_key = get_upsampler(mode, tile_size)
+    # GFPGAN expects a 4x background upsampler; final 2x output is resized
+    # after faces are pasted back.
+    upsampler, model_key = get_upsampler(mode, tile_size, model_scale=4)
     device = _device()
     half = device.type == "cuda"
     tile = _tile_value(tile_size)
@@ -394,8 +421,8 @@ def _enhance_once(
     tile_size: int,
     face_enhance: bool,
 ) -> tuple[np.ndarray, str]:
-    upsampler, model_key = get_upsampler(mode, tile_size)
     if face_enhance:
+        model_key = resolve_model(mode)
         enhancer = get_face_enhancer(mode, tile_size)
         _, _, output = enhancer.enhance(
             image,
@@ -404,6 +431,7 @@ def _enhance_once(
             paste_back=True,
         )
     else:
+        upsampler, model_key = get_upsampler(mode, tile_size, model_scale=scale)
         output, _ = upsampler.enhance(image, outscale=float(scale))
 
     target_width, target_height = _target_size(image, scale)
@@ -431,11 +459,16 @@ def enhance_bgr(
         raise ValueError("Input image is empty.")
     scale = _scale_value(scale)
     tile = _tile_value(tile_size)
-    attempts = [tile]
-    if tile >= 128:
-        smaller = max(64, tile // 2)
-        if smaller != tile:
-            attempts.append(smaller)
+    if tile == 0:
+        # Full-frame inference is fastest for small/medium video frames. If a
+        # high-resolution frame does not fit, fall back through safe tiles.
+        attempts = [0, 1024, 512, 256, 128]
+    else:
+        attempts = [tile]
+        if tile >= 128:
+            smaller = max(64, tile // 2)
+            if smaller != tile:
+                attempts.append(smaller)
 
     last_error: Optional[BaseException] = None
     for index, attempt in enumerate(attempts):
@@ -586,13 +619,18 @@ def upscale_video(
     if not math.isfinite(fps) or fps <= 0:
         fps = 30.0
     target_width, target_height = width * scale, height * scale
+    # A whole 720p/1080p frame is faster than dozens of tiny sequential tiles.
+    # If it does not fit, enhance_bgr automatically retries with safe tiles.
+    video_tile = 0 if tile >= 512 and width * height <= 2_500_000 else tile
+    if video_tile == 0:
+        print(f"[PARAM] Video full-frame mode for {width}×{height}; CUDA OOM will fall back to tiles")
     destination = _output_path(source, scale, ".mp4")
     work_dir = Path(tempfile.mkdtemp(prefix="param_upscale_", dir=str(ROOT)))
     raw_video = work_dir / "silent_upscaled.mp4"
     writer = None
     frame_index = 0
     model_key = resolve_model(model_mode)
-    used_tile = tile
+    used_tile = video_tile
 
     try:
         writer = cv2.VideoWriter(
@@ -614,7 +652,7 @@ def upscale_video(
                 frame,
                 scale,
                 model_mode,
-                tile,
+                video_tile,
                 bool(face_enhance),
             )
             output = _resize_to_target(output, target_width, target_height)
@@ -676,7 +714,7 @@ def build_app() -> Any:
 
         with gr.Row():
             with gr.Column(scale=1):
-                scale = gr.Radio(["2x", "4x"], value="4x", label="Output scale")
+                scale = gr.Radio(["2x", "4x"], value="2x", label="Output scale")
                 model = gr.Dropdown(
                     ["Auto (recommended)", "Photo / real-world", "Anime / illustration"],
                     value="Auto (recommended)",
