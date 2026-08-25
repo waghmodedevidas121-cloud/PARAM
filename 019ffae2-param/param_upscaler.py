@@ -1038,6 +1038,125 @@ def _run_video2x(
     return model_name
 
 
+def _forward_model_batch(
+    frames: list[np.ndarray],
+    upsampler: Any,
+    tile_size: int = 0,
+) -> list[np.ndarray]:
+    """Run same-sized BGR frames through CUDA, batching full frames or tiles."""
+
+    if not frames:
+        return []
+    model = upsampler.model
+    native_scale = int(upsampler.scale)
+    height, width = frames[0].shape[:2]
+    if tile_size and tile_size > 0:
+        output_frames = np.empty(
+            (len(frames), height * native_scale, width * native_scale, 3),
+            dtype=np.uint8,
+        )
+        tiles_x = math.ceil(width / tile_size)
+        tiles_y = math.ceil(height / tile_size)
+        for y in range(tiles_y):
+            for x in range(tiles_x):
+                input_start_x = x * tile_size
+                input_end_x = min(input_start_x + tile_size, width)
+                input_start_y = y * tile_size
+                input_end_y = min(input_start_y + tile_size, height)
+                pad_start_x = max(input_start_x - 10, 0)
+                pad_end_x = min(input_end_x + 10, width)
+                pad_start_y = max(input_start_y - 10, 0)
+                pad_end_y = min(input_end_y + 10, height)
+                crops = [
+                    frame[pad_start_y:pad_end_y, pad_start_x:pad_end_x]
+                    for frame in frames
+                ]
+                tile_outputs = _forward_model_batch(crops, upsampler, tile_size=0)
+                output_start_x = input_start_x * native_scale
+                output_end_x = input_end_x * native_scale
+                output_start_y = input_start_y * native_scale
+                output_end_y = input_end_y * native_scale
+                inner_start_x = (input_start_x - pad_start_x) * native_scale
+                inner_end_x = inner_start_x + (input_end_x - input_start_x) * native_scale
+                inner_start_y = (input_start_y - pad_start_y) * native_scale
+                inner_end_y = inner_start_y + (input_end_y - input_start_y) * native_scale
+                for index, tile_output in enumerate(tile_outputs):
+                    output_frames[index][output_start_y:output_end_y, output_start_x:output_end_x] = (
+                        tile_output[inner_start_y:inner_end_y, inner_start_x:inner_end_x]
+                    )
+        return [output_frames[index] for index in range(len(frames))]
+
+    pad_height = (native_scale - height % native_scale) % native_scale if native_scale == 2 else 0
+    pad_width = (native_scale - width % native_scale) % native_scale if native_scale == 2 else 0
+    padded = [
+        cv2.copyMakeBorder(frame, 0, pad_height, 0, pad_width, cv2.BORDER_REFLECT_101)
+        if pad_height or pad_width
+        else frame
+        for frame in frames
+    ]
+    rgb = np.stack([cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in padded]).astype(np.float32) / 255.0
+    tensor = torch.from_numpy(np.ascontiguousarray(np.transpose(rgb, (0, 3, 1, 2)))).to(_require_cuda())
+    first_parameter = next(model.parameters())
+    if first_parameter.dtype == torch.float16:
+        tensor = tensor.half()
+    with torch.inference_mode():
+        output = model(tensor)
+    output = output.float().cpu().clamp_(0, 1).numpy()
+    output = np.transpose(output[:, [2, 1, 0], :, :], (0, 2, 3, 1))
+    output = (output * 255.0).round().astype(np.uint8)
+    if pad_height or pad_width:
+        output = output[:, :height * native_scale, :width * native_scale, :]
+    return [output[index] for index in range(output.shape[0])]
+
+
+
+def _batch_enhance_video(
+    frames: list[np.ndarray],
+    scale: int,
+    model_mode: Any,
+    requested_tile: int,
+    preferred_batch: int,
+) -> tuple[list[np.ndarray], str, int, int]:
+    """Batch video frames and retry with smaller batches/tiles after OOM."""
+
+    if requested_tile == 0:
+        tile_attempts = [0, 1024, 512, 256, 128]
+    else:
+        tile_attempts = [requested_tile]
+        while tile_attempts[-1] >= 128:
+            smaller = max(64, tile_attempts[-1] // 2)
+            if smaller == tile_attempts[-1]:
+                break
+            tile_attempts.append(smaller)
+    for tile in tile_attempts:
+        try:
+            upsampler, model_key = get_upsampler(model_mode, tile, model_scale=scale)
+        except RuntimeError as error:
+            if not _is_cuda_oom(error):
+                raise
+            _clear_model_caches()
+            continue
+        batch_attempts = []
+        current_batch = max(1, min(preferred_batch, len(frames)))
+        while current_batch not in batch_attempts:
+            batch_attempts.append(current_batch)
+            if current_batch == 1:
+                break
+            current_batch = max(1, current_batch // 2)
+        for batch_size in batch_attempts:
+            try:
+                outputs: list[np.ndarray] = []
+                for start in range(0, len(frames), batch_size):
+                    outputs.extend(_forward_model_batch(frames[start:start + batch_size], upsampler, tile_size=tile))
+                return outputs, model_key, tile, batch_size
+            except RuntimeError as error:
+                if not _is_cuda_oom(error):
+                    raise
+                _clear_model_caches()
+                break
+    raise RuntimeError("CUDA ran out of memory for every video batch/tile configuration.")
+
+
 def _upscale_video_cuda(
     input_file: Any,
     scale_choice: Any = "2x",
@@ -1047,7 +1166,7 @@ def _upscale_video_cuda(
     progress: ProgressFn = None,
     fallback_reason: Optional[str] = None,
 ) -> tuple[str, str]:
-    """CUDA fallback for video when the Video2X Vulkan runtime is unavailable."""
+    """Optimized CUDA fallback with batched frame inference."""
 
     source = _as_path(input_file)
     if source is None:
@@ -1070,11 +1189,11 @@ def _upscale_video_cuda(
     if not math.isfinite(fps) or fps <= 0:
         fps = 30.0
     target_width, target_height = width * scale, height * scale
-    # A whole 720p/1080p frame is faster than dozens of tiny sequential tiles.
-    # If it does not fit, enhance_bgr automatically retries with safe tiles.
-    video_tile = 0 if tile >= 512 and width * height <= 2_500_000 else tile
+    # Full-frame batches are much faster for 720p/1080p. OOM retries use tiles.
+    video_tile = 0 if tile >= 512 and width * height <= 2_500_000 and not face_enhance else tile
+    preferred_batch = 4 if width * height <= 2_500_000 else 2 if width * height <= 8_000_000 else 1
     if video_tile == 0:
-        print(f"[PARAM] Video full-frame mode for {width}×{height}; CUDA OOM will fall back to tiles")
+        print(f"[PARAM] CUDA full-frame batch mode for {width}×{height}; OOM will fall back to tiles", flush=True)
     destination = _output_path(source, scale, ".mp4")
     work_dir = Path(tempfile.mkdtemp(prefix="param_upscale_", dir=str(ROOT)))
     raw_video = work_dir / "silent_upscaled.mp4"
@@ -1082,6 +1201,7 @@ def _upscale_video_cuda(
     frame_index = 0
     model_key = resolve_model(model_mode)
     used_tile = video_tile
+    used_batch = 1
 
     try:
         writer = cv2.VideoWriter(
@@ -1094,30 +1214,47 @@ def _upscale_video_cuda(
             raise RuntimeError("Could not create the temporary output video.")
 
         while True:
-            ok, frame = cap.read()
-            if not ok:
+            frames: list[np.ndarray] = []
+            while len(frames) < preferred_batch:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            if not frames:
                 break
             if frame_index == 0:
-                _report(progress, 0.02, "Loading AI model (first run downloads the checkpoint)")
-            output, model_key, used_tile = enhance_bgr(
-                frame,
-                scale,
-                model_mode,
-                video_tile,
-                bool(face_enhance),
-            )
-            output = _resize_to_target(output, target_width, target_height)
-            writer.write(output)
-            frame_index += 1
+                _report(progress, 0.02, "Loading CUDA AI model")
+            if face_enhance:
+                processed_frames = []
+                for frame in frames:
+                    output, model_key, used_tile = enhance_bgr(
+                        frame,
+                        scale,
+                        model_mode,
+                        tile,
+                        True,
+                    )
+                    processed_frames.append(output)
+            else:
+                processed_frames, model_key, used_tile, used_batch = _batch_enhance_video(
+                    frames,
+                    scale,
+                    model_mode,
+                    video_tile,
+                    preferred_batch,
+                )
+            for output in processed_frames:
+                output = _resize_to_target(output, target_width, target_height)
+                writer.write(output)
+                frame_index += 1
             if total > 0:
                 fraction = 0.05 + 0.88 * (frame_index / total)
-                _report(progress, fraction, f"Upscaling frame {frame_index}/{total}")
-            elif frame_index % 5 == 0:
-                _report(progress, 0.5, f"Upscaling frame {frame_index}")
+                _report(progress, fraction, f"CUDA frame {frame_index}/{total} (batch {used_batch})")
+            else:
+                _report(progress, 0.5, f"CUDA frame {frame_index} (batch {used_batch})")
 
-        if writer is not None:
-            writer.release()
-            writer = None
+        writer.release()
+        writer = None
         cap.release()
         if frame_index == 0:
             raise ValueError("No frames could be read from this video.")
@@ -1126,13 +1263,13 @@ def _upscale_video_cuda(
         audio_preserved = _mux_video_audio(raw_video, source, destination)
         extras = " + GFPGAN face restoration" if face_enhance else ""
         audio_note = "audio preserved" if audio_preserved else "audio unavailable"
-        device = _device()
-        device_text = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+        device = _require_cuda()
+        device_text = torch.cuda.get_device_name(device)
         backend_note = "CUDA fallback (Video2X Vulkan unavailable)" if fallback_reason else "CUDA PyTorch"
         status = (
             f"✅ **Done:** `{source.name}` · {width}×{height} → {target_width}×{target_height} · "
-            f"{scale}x · {frame_index} frames · {_model_label(model_key)}{extras} · {audio_note} · "
-            f"{device_text} · {backend_note}"
+            f"{scale}x · {frame_index} frames · {_model_label(model_key)}{extras} · "
+            f"batch {used_batch} · {audio_note} · {device_text} · {backend_note}"
         )
         _report(progress, 1.0, "Finished")
         return str(destination), status
