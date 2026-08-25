@@ -212,6 +212,46 @@ def _download_asset(kind: str) -> Path:
     return destination
 
 
+def _nvidia_driver_major() -> Optional[str]:
+    """Read the host NVIDIA driver major version without changing it."""
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+)\.", result.stdout or "")
+    return match.group(1) if match else None
+
+
+def _has_nvidia_gl_library() -> bool:
+    candidates = [
+        Path("/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0"),
+        Path("/usr/lib/x86_64-linux-gnu/nvidia/libGLX_nvidia.so.0"),
+        Path("/usr/lib/x86_64-linux-gnu/nvidia/current/libGLX_nvidia.so.0"),
+    ]
+    if any(path.is_file() for path in candidates):
+        return True
+    try:
+        result = subprocess.run(
+            ["ldconfig", "-p"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(re.search(r"libGLX_nvidia\.so\.0.*=>\s*\S+", result.stdout or ""))
+
+
 def _ensure_vulkan_runtime(progress: ProgressFn = None) -> None:
     """Install the Vulkan loader/dev tools that some Colab images omit."""
 
@@ -259,12 +299,26 @@ def _ensure_vulkan_runtime(progress: ProgressFn = None) -> None:
     if update.returncode != 0 or install.returncode != 0:
         details = "\n".join((install.stdout or update.stdout or "").splitlines()[-8:])
         raise RuntimeError("Could not install the Vulkan runtime in Colab.\n" + details)
+
+    # Some Colab images have the CUDA driver but not its GL/Vulkan ICD package.
+    # Install only the userspace GL package matching nvidia-smi; never install
+    # or replace the kernel driver inside the hosted runtime.
+    driver_major = _nvidia_driver_major()
+    if driver_major and not _has_nvidia_gl_library():
+        _report(progress, 0.06, f"Installing NVIDIA Vulkan userspace library ({driver_major})")
+        subprocess.run(
+            [apt_get, "install", "-y", "-qq", f"libnvidia-gl-{driver_major}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+
     try:
         ctypes.CDLL("libvulkan.so.1")
     except OSError as error:
         raise RuntimeError("Vulkan loader installation finished, but libvulkan.so.1 is still unavailable.") from error
     _VULKAN_RUNTIME_READY = True
-
 
 def _configure_vulkan_environment() -> dict[str, str]:
     """Point the Vulkan loader at Colab's NVIDIA ICD when it is available."""
@@ -291,6 +345,21 @@ def _configure_vulkan_environment() -> dict[str, str]:
             found = find_library("GLX_nvidia")
             if found and Path(found).is_file():
                 library = Path(found)
+        if library is None:
+            try:
+                ldconfig = subprocess.run(
+                    ["ldconfig", "-p"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                match = re.search(r"libGLX_nvidia\.so\.0.*=>\s*(\S+)", ldconfig.stdout or "")
+                if match:
+                    library = Path(match.group(1))
+            except (OSError, subprocess.SubprocessError):
+                pass
         if library is not None:
             VIDEO2X_DIR.mkdir(parents=True, exist_ok=True)
             icd = VIDEO2X_DIR / "nvidia_icd.json"
