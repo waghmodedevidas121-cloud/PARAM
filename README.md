@@ -16,3 +16,5 @@
 The Image tab uses tiled FP16 Real-ESRGAN inference. The Video tab tries Video2X 6.4.0's C++/Vulkan pipeline first and automatically falls back to batched CUDA AI inference when the Colab host does not expose Vulkan. The notebook is self-contained: it does not mount Google Drive, and runtime files stay under `/content/PARAM_Upscaler/`. **Auto** is the safe default for real photographs; choose **Anime / illustration** for cartoons and line art. GFPGAN face restoration is optional for images and can change facial details.
 
 No model checkpoints are committed to the repository. They download into the Colab runtime only when first needed.
+
+The Gradio app also includes post-upscale colour grading: exposure, contrast, saturation, temperature, tint, LUT strength, and custom 3D `.cube` LUT uploads for both images and videos.

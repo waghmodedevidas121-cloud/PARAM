@@ -740,6 +740,165 @@ def _load_bgr(path: Path) -> np.ndarray:
     return image
 
 
+
+_LUT_CACHE: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+
+def _color_options(
+    lut_file: Any = None,
+    lut_strength: Any = 1.0,
+    exposure: Any = 0.0,
+    contrast: Any = 1.0,
+    saturation: Any = 1.0,
+    temperature: Any = 0.0,
+    tint: Any = 0.0,
+) -> dict[str, Any]:
+    lut_path = _as_path(lut_file)
+    if lut_path is not None:
+        if lut_path.suffix.lower() != ".cube":
+            raise ValueError("Custom LUT must be a .cube file.")
+        if not lut_path.exists():
+            raise ValueError("The selected LUT file no longer exists in this runtime.")
+    return {
+        "lut_path": lut_path,
+        "lut_strength": max(0.0, min(1.0, float(lut_strength or 0.0))),
+        "exposure": float(exposure or 0.0),
+        "contrast": max(0.0, float(contrast or 1.0)),
+        "saturation": max(0.0, float(saturation or 1.0)),
+        "temperature": float(temperature or 0.0),
+        "tint": float(tint or 0.0),
+    }
+
+
+def _color_grade_active(options: Optional[dict[str, Any]]) -> bool:
+    if not options:
+        return False
+    return bool(
+        options.get("lut_path")
+        or abs(float(options.get("exposure", 0.0))) > 1e-6
+        or abs(float(options.get("contrast", 1.0)) - 1.0) > 1e-6
+        or abs(float(options.get("saturation", 1.0)) - 1.0) > 1e-6
+        or abs(float(options.get("temperature", 0.0))) > 1e-6
+        or abs(float(options.get("tint", 0.0))) > 1e-6
+    )
+
+
+def _load_cube_lut(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load a standard 3D .cube LUT and cache it for the current runtime."""
+
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    if key in _LUT_CACHE:
+        return _LUT_CACHE[key]
+    size: Optional[int] = None
+    domain_min = np.zeros(3, dtype=np.float32)
+    domain_max = np.ones(3, dtype=np.float32)
+    values: list[list[float]] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.replace("\t", " ").split()
+            key_name = parts[0].upper()
+            if key_name == "LUT_3D_SIZE":
+                size = int(parts[1])
+            elif key_name in {"DOMAIN_MIN", "LUT_3D_INPUT_RANGE_MIN"}:
+                domain_min = np.asarray([float(v) for v in parts[1:4]], dtype=np.float32)
+            elif key_name in {"DOMAIN_MAX", "LUT_3D_INPUT_RANGE_MAX"}:
+                domain_max = np.asarray([float(v) for v in parts[1:4]], dtype=np.float32)
+            elif key_name in {"LUT_1D_SIZE", "LUT_1D_INPUT_RANGE_MIN", "LUT_1D_INPUT_RANGE_MAX"}:
+                if key_name == "LUT_1D_SIZE":
+                    raise ValueError("Only 3D .cube LUTs are supported.")
+            elif len(parts) == 3:
+                try:
+                    values.append([float(v) for v in parts])
+                except ValueError:
+                    continue
+    if size is None or len(values) != size**3:
+        raise ValueError(f"Invalid .cube LUT: expected {size or '?'}³ colour entries, found {len(values)}.")
+    if np.any(domain_max <= domain_min):
+        raise ValueError("Invalid .cube LUT domain range.")
+    lut = np.asarray(values, dtype=np.float32).reshape((size, size, size, 3))
+    loaded = (lut, domain_min, domain_max)
+    _LUT_CACHE[key] = loaded
+    return loaded
+
+
+def _apply_lut_rgb(rgb: np.ndarray, lut_path: Path, strength: float) -> np.ndarray:
+    lut, domain_min, domain_max = _load_cube_lut(lut_path)
+    size = lut.shape[0]
+    coordinates = np.clip((rgb - domain_min) / (domain_max - domain_min), 0.0, 1.0) * (size - 1)
+    lower = np.floor(coordinates).astype(np.int32)
+    upper = np.minimum(lower + 1, size - 1)
+    weight = coordinates - lower
+    r0, g0, b0 = lower[..., 0], lower[..., 1], lower[..., 2]
+    r1, g1, b1 = upper[..., 0], upper[..., 1], upper[..., 2]
+    wr, wg, wb = weight[..., 0:1], weight[..., 1:2], weight[..., 2:3]
+    c000 = lut[r0, g0, b0]
+    c001 = lut[r0, g0, b1]
+    c010 = lut[r0, g1, b0]
+    c011 = lut[r0, g1, b1]
+    c100 = lut[r1, g0, b0]
+    c101 = lut[r1, g0, b1]
+    c110 = lut[r1, g1, b0]
+    c111 = lut[r1, g1, b1]
+    c00 = c000 * (1.0 - wb) + c001 * wb
+    c01 = c010 * (1.0 - wb) + c011 * wb
+    c10 = c100 * (1.0 - wb) + c101 * wb
+    c11 = c110 * (1.0 - wb) + c111 * wb
+    c0 = c00 * (1.0 - wg) + c01 * wg
+    c1 = c10 * (1.0 - wg) + c11 * wg
+    graded = c0 * (1.0 - wr) + c1 * wr
+    return rgb * (1.0 - strength) + graded * strength
+
+
+def apply_color_grade_bgr(image: np.ndarray, options: Optional[dict[str, Any]]) -> np.ndarray:
+    """Apply exposure, contrast, saturation, temperature, tint, and a .cube LUT."""
+
+    if not _color_grade_active(options):
+        return image
+    assert options is not None
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    exposure = float(options.get("exposure", 0.0))
+    contrast = float(options.get("contrast", 1.0))
+    saturation = float(options.get("saturation", 1.0))
+    temperature = float(options.get("temperature", 0.0)) / 100.0
+    tint = float(options.get("tint", 0.0)) / 100.0
+    rgb = rgb * (2.0**exposure)
+    rgb = (rgb - 0.5) * contrast + 0.5
+    gains = np.asarray(
+        [1.0 + 0.15 * temperature + 0.05 * tint, 1.0 - 0.10 * tint, 1.0 - 0.15 * temperature + 0.05 * tint],
+        dtype=np.float32,
+    )
+    rgb = rgb * gains
+    if abs(saturation - 1.0) > 1e-6:
+        hsv = cv2.cvtColor(np.clip(rgb, 0.0, 1.0), cv2.COLOR_RGB2HSV)
+        hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0.0, 1.0)
+        rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    lut_path = options.get("lut_path")
+    if lut_path is not None and float(options.get("lut_strength", 0.0)) > 0:
+        rgb = _apply_lut_rgb(rgb, lut_path, float(options["lut_strength"]))
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return cv2.cvtColor((rgb * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+
+def _color_grade_note(options: Optional[dict[str, Any]]) -> str:
+    if not _color_grade_active(options):
+        return ""
+    pieces = []
+    if options and options.get("lut_path"):
+        pieces.append(f"LUT {Path(options['lut_path']).name}")
+    if options and abs(float(options.get("exposure", 0.0))) > 1e-6:
+        pieces.append(f"exposure {float(options['exposure']):+.1f} EV")
+    if options and abs(float(options.get("contrast", 1.0)) - 1.0) > 1e-6:
+        pieces.append("contrast")
+    if options and abs(float(options.get("saturation", 1.0)) - 1.0) > 1e-6:
+        pieces.append("saturation")
+    if options and (abs(float(options.get("temperature", 0.0))) > 1e-6 or abs(float(options.get("tint", 0.0))) > 1e-6):
+        pieces.append("temperature/tint")
+    return "colour grade: " + ", ".join(pieces)
+
 def _target_size(image: np.ndarray, scale: int) -> tuple[int, int]:
     height, width = image.shape[:2]
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
@@ -854,6 +1013,13 @@ def upscale_image(
     model_mode: Any = "Auto (recommended)",
     face_enhance: bool = False,
     tile_size: Any = 512,
+    lut_file: Any = None,
+    lut_strength: Any = 1.0,
+    exposure: Any = 0.0,
+    contrast: Any = 1.0,
+    saturation: Any = 1.0,
+    temperature: Any = 0.0,
+    tint: Any = 0.0,
     progress: ProgressFn = None,
 ) -> tuple[str, str]:
     """Gradio callback for images."""
@@ -865,6 +1031,15 @@ def upscale_image(
         raise ValueError(f"Unsupported image type: {source.suffix or 'unknown'}")
     scale = _scale_value(scale_choice)
     tile = _tile_value(tile_size)
+    color_options = _color_options(
+        lut_file,
+        lut_strength,
+        exposure,
+        contrast,
+        saturation,
+        temperature,
+        tint,
+    )
     _report(progress, 0.02, "Reading image")
     image = _load_bgr(source)
     if image.shape[0] * image.shape[1] > MAX_IMAGE_PIXELS:
@@ -874,11 +1049,17 @@ def upscale_image(
         )
     _report(progress, 0.08, "Loading AI model (first run downloads the checkpoint)")
     output, model_key, used_tile = enhance_bgr(image, scale, model_mode, tile, bool(face_enhance))
+    if _color_grade_active(color_options):
+        _report(progress, 0.90, "Applying colour correction / LUT")
+        output = apply_color_grade_bgr(output, color_options)
     _report(progress, 0.94, "Saving PNG")
     destination = _output_path(source, scale, ".png")
     if not cv2.imwrite(str(destination), output, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
         raise RuntimeError("Could not write the upscaled PNG.")
     status = _status_text(source, image.shape, output.shape, scale, model_key, used_tile, bool(face_enhance))
+    grade_note = _color_grade_note(color_options)
+    if grade_note:
+        status += f" · {grade_note}"
     _report(progress, 1.0, "Finished")
     return str(destination), status
 
@@ -1038,6 +1219,59 @@ def _run_video2x(
     return model_name
 
 
+
+def _apply_color_grade_video(
+    video_path: Path,
+    audio_source: Path,
+    options: Optional[dict[str, Any]],
+    progress: ProgressFn = None,
+) -> None:
+    """Grade an already-upscaled video and mux the original audio back in."""
+
+    if not _color_grade_active(options):
+        return
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Could not reopen the upscaled video for colour grading.")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    work_dir = Path(tempfile.mkdtemp(prefix="param_grade_", dir=str(ROOT)))
+    raw_video = work_dir / "graded_silent.mp4"
+    writer = None
+    frame_index = 0
+    try:
+        writer = cv2.VideoWriter(
+            str(raw_video),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError("Could not create the temporary colour-graded video.")
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(apply_color_grade_bgr(frame, options))
+            frame_index += 1
+            if total > 0:
+                _report(progress, 0.20 + 0.70 * frame_index / total, f"Applying colour grade {frame_index}/{total}")
+        writer.release()
+        writer = None
+        cap.release()
+        if frame_index == 0:
+            raise RuntimeError("The upscaled video had no readable frames for colour grading.")
+        _mux_video_audio(raw_video, audio_source, video_path)
+    finally:
+        if writer is not None:
+            writer.release()
+        cap.release()
+        shutil.rmtree(work_dir, ignore_errors=True)
+
 def _forward_model_batch(
     frames: list[np.ndarray],
     upsampler: Any,
@@ -1165,6 +1399,7 @@ def _upscale_video_cuda(
     tile_size: Any = 512,
     progress: ProgressFn = None,
     fallback_reason: Optional[str] = None,
+    color_options: Optional[dict[str, Any]] = None,
 ) -> tuple[str, str]:
     """Optimized CUDA fallback with batched frame inference."""
 
@@ -1245,6 +1480,8 @@ def _upscale_video_cuda(
                 )
             for output in processed_frames:
                 output = _resize_to_target(output, target_width, target_height)
+                if _color_grade_active(color_options):
+                    output = apply_color_grade_bgr(output, color_options)
                 writer.write(output)
                 frame_index += 1
             if total > 0:
@@ -1266,10 +1503,12 @@ def _upscale_video_cuda(
         device = _require_cuda()
         device_text = torch.cuda.get_device_name(device)
         backend_note = "CUDA fallback (Video2X Vulkan unavailable)" if fallback_reason else "CUDA PyTorch"
+        grade_note = _color_grade_note(color_options)
         status = (
             f"✅ **Done:** `{source.name}` · {width}×{height} → {target_width}×{target_height} · "
             f"{scale}x · {frame_index} frames · {_model_label(model_key)}{extras} · "
             f"batch {used_batch} · {audio_note} · {device_text} · {backend_note}"
+            + (f" · {grade_note}" if grade_note else "")
         )
         _report(progress, 1.0, "Finished")
         return str(destination), status
@@ -1288,6 +1527,13 @@ def upscale_video(
     face_enhance: bool = False,
     tile_size: Any = 512,
     backend_choice: Any = "Auto (Video2X → CUDA)",
+    lut_file: Any = None,
+    lut_strength: Any = 1.0,
+    exposure: Any = 0.0,
+    contrast: Any = 1.0,
+    saturation: Any = 1.0,
+    temperature: Any = 0.0,
+    tint: Any = 0.0,
     progress: ProgressFn = None,
 ) -> tuple[str, str]:
     """Gradio callback for videos with Video2X-first hybrid execution.
@@ -1304,12 +1550,29 @@ def upscale_video(
     if source.suffix.lower() not in VIDEO_EXTENSIONS:
         raise ValueError(f"Unsupported video type: {source.suffix or 'unknown'}")
     scale = _scale_value(scale_choice)
+    color_options = _color_options(
+        lut_file,
+        lut_strength,
+        exposure,
+        contrast,
+        saturation,
+        temperature,
+        tint,
+    )
     backend = str(backend_choice or "Auto (Video2X → CUDA)").lower()
     if "video2x" in backend and "only" in backend and face_enhance:
         raise ValueError("Video2X does not use GFPGAN. Turn off face restoration or choose Auto/CUDA backend.")
 
     if "cuda" in backend and "video2x" not in backend:
-        return _upscale_video_cuda(source, scale, model_mode, bool(face_enhance), tile_size, progress)
+        return _upscale_video_cuda(
+            source,
+            scale,
+            model_mode,
+            bool(face_enhance),
+            tile_size,
+            progress,
+            color_options=color_options,
+        )
 
     if face_enhance:
         # Auto mode remains useful with the face toggle: use the CUDA path
@@ -1322,6 +1585,7 @@ def upscale_video(
             tile_size,
             progress,
             fallback_reason="GFPGAN requires the CUDA backend",
+            color_options=color_options,
         )
 
     cap = cv2.VideoCapture(str(source))
@@ -1335,11 +1599,16 @@ def upscale_video(
     destination = _output_path(source, scale, ".mp4")
     try:
         model_name = _run_video2x(source, destination, scale, model_mode, progress)
+        if _color_grade_active(color_options):
+            _report(progress, 0.18, "Applying colour correction / LUT")
+            _apply_color_grade_video(destination, source, color_options, progress)
         frame_text = f" · {total} frames" if total > 0 else ""
+        grade_note = _color_grade_note(color_options)
         status = (
             f"✅ **Done:** `{source.name}` · {width}×{height} → {width * scale}×{height * scale} · "
             f"{scale}x · Video2X {VIDEO2X_VERSION} · {model_name} · "
             f"Vulkan GPU {_VIDEO2X_DEVICE_INDEX}{frame_text} · audio preserved"
+            + (f" · {grade_note}" if grade_note else "")
         )
         return str(destination), status
     except Exception as error:
@@ -1360,6 +1629,7 @@ def upscale_video(
             tile_size,
             progress,
             fallback_reason=str(error),
+            color_options=color_options,
         )
 
 def build_app() -> Any:
@@ -1406,6 +1676,22 @@ def build_app() -> Any:
                     info="Used by image Real-ESRGAN. Video2X selects its own Vulkan tile size automatically.",
                 )
 
+        with gr.Accordion("Colour correction and custom LUT", open=False):
+            gr.Markdown("These controls are applied **after** AI upscaling. Upload a 3D `.cube` LUT or use the basic controls alone.")
+            lut_file = gr.File(
+                label="Custom 3D LUT (.cube)",
+                file_types=[".cube"],
+                type="filepath",
+            )
+            with gr.Row():
+                lut_strength = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="LUT strength")
+                exposure = gr.Slider(-3.0, 3.0, value=0.0, step=0.1, label="Exposure (EV)")
+                contrast = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Contrast")
+            with gr.Row():
+                saturation = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Saturation")
+                temperature = gr.Slider(-100, 100, value=0, step=1, label="Temperature")
+                tint = gr.Slider(-100, 100, value=0, step=1, label="Tint")
+
         with gr.Tab("Image"):
             with gr.Row():
                 image_input = gr.File(
@@ -1443,8 +1729,36 @@ def build_app() -> Any:
 
         # Defining the progress default inside build_app keeps gradio optional
         # for users who only want to import the backend in a script.
-        def image_job(input_file, scale_choice, model_mode, face_enhance, tile_size, progress=gr.Progress()):
-            return upscale_image(input_file, scale_choice, model_mode, face_enhance, tile_size, progress)
+        def image_job(
+            input_file,
+            scale_choice,
+            model_mode,
+            face_enhance,
+            tile_size,
+            lut_file,
+            lut_strength,
+            exposure,
+            contrast,
+            saturation,
+            temperature,
+            tint,
+            progress=gr.Progress(),
+        ):
+            return upscale_image(
+                input_file,
+                scale_choice,
+                model_mode,
+                face_enhance,
+                tile_size,
+                lut_file,
+                lut_strength,
+                exposure,
+                contrast,
+                saturation,
+                temperature,
+                tint,
+                progress,
+            )
 
         def video_job(
             input_file,
@@ -1453,6 +1767,13 @@ def build_app() -> Any:
             face_enhance,
             tile_size,
             backend_choice,
+            lut_file,
+            lut_strength,
+            exposure,
+            contrast,
+            saturation,
+            temperature,
+            tint,
             progress=gr.Progress(),
         ):
             return upscale_video(
@@ -1462,18 +1783,26 @@ def build_app() -> Any:
                 face_enhance,
                 tile_size,
                 backend_choice,
+                lut_file,
+                lut_strength,
+                exposure,
+                contrast,
+                saturation,
+                temperature,
+                tint,
                 progress,
             )
 
         common_inputs = [scale, model, face, tile]
+        color_inputs = [lut_file, lut_strength, exposure, contrast, saturation, temperature, tint]
         image_button.click(
             image_job,
-            inputs=[image_input, *common_inputs],
+            inputs=[image_input, *common_inputs, *color_inputs],
             outputs=[image_output, image_status],
         )
         video_button.click(
             video_job,
-            inputs=[video_input, *common_inputs, video_backend],
+            inputs=[video_input, *common_inputs, video_backend, *color_inputs],
             outputs=[video_output, video_status],
         )
 
