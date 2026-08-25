@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 from urllib.request import Request, urlopen
 
 import ctypes
+from ctypes.util import find_library
 import cv2
 import numpy as np
 import torch
@@ -85,6 +86,7 @@ VIDEO2X_DIR = ROOT / "video2x"
 VIDEO2X_APPIMAGE = VIDEO2X_DIR / f"Video2X-{VIDEO2X_VERSION}.AppImage"
 _VIDEO2X_RUNTIME: Optional[tuple[list[str], Path, dict[str, str]]] = None
 _VIDEO2X_DEVICE_INDEX = 0
+_VULKAN_RUNTIME_READY = False
 
 
 def _model_label(model_key: str) -> str:
@@ -211,18 +213,35 @@ def _download_asset(kind: str) -> Path:
 
 
 def _ensure_vulkan_runtime(progress: ProgressFn = None) -> None:
-    """Install the Vulkan loader that is absent from some Colab images."""
+    """Install the Vulkan loader/dev tools that some Colab images omit."""
 
+    global _VULKAN_RUNTIME_READY
+    if _VULKAN_RUNTIME_READY:
+        return
     try:
         ctypes.CDLL("libvulkan.so.1")
-        return
+        loader_present = True
     except OSError:
-        pass
+        loader_present = False
 
     apt_get = shutil.which("apt-get")
     if apt_get is None:
-        raise RuntimeError("libvulkan.so.1 is missing and apt-get is unavailable in this runtime.")
-    _report(progress, 0.01, "Installing Vulkan runtime for Video2X")
+        if not loader_present:
+            raise RuntimeError("libvulkan.so.1 is missing and apt-get is unavailable in this runtime.")
+        _VULKAN_RUNTIME_READY = True
+        return
+
+    _report(progress, 0.01, "Checking Vulkan runtime for Video2X")
+    # libvulkan-dev is useful on Colab images where only CUDA libraries are
+    # present; the NVIDIA ICD itself must come from the host driver.
+    packages = [
+        "libvulkan1",
+        "libvulkan-dev",
+        "vulkan-tools",
+        "glslang-dev",
+        "glslang-tools",
+        "mesa-vulkan-drivers",
+    ]
     update = subprocess.run(
         [apt_get, "update", "-qq"],
         stdout=subprocess.PIPE,
@@ -231,7 +250,7 @@ def _ensure_vulkan_runtime(progress: ProgressFn = None) -> None:
         check=False,
     )
     install = subprocess.run(
-        [apt_get, "install", "-y", "-qq", "libvulkan1", "vulkan-tools", "mesa-vulkan-drivers"],
+        [apt_get, "install", "-y", "-qq", *packages],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -244,7 +263,53 @@ def _ensure_vulkan_runtime(progress: ProgressFn = None) -> None:
         ctypes.CDLL("libvulkan.so.1")
     except OSError as error:
         raise RuntimeError("Vulkan loader installation finished, but libvulkan.so.1 is still unavailable.") from error
+    _VULKAN_RUNTIME_READY = True
 
+
+def _configure_vulkan_environment() -> dict[str, str]:
+    """Point the Vulkan loader at Colab's NVIDIA ICD when it is available."""
+
+    env = os.environ.copy()
+    icd_candidates = [
+        Path("/etc/vulkan/icd.d/nvidia_icd.json"),
+        Path("/usr/share/vulkan/icd.d/nvidia_icd.json"),
+        Path("/etc/vulkan/icd.d/nvidia_icd.x86_64.json"),
+        Path("/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json"),
+    ]
+    icd = next((path for path in icd_candidates if path.is_file()), None)
+
+    # Some hosted runtimes expose libGLX_nvidia.so.0 but omit the matching ICD
+    # manifest. A local manifest lets the loader discover that host-mounted
+    # driver without installing or replacing the NVIDIA driver itself.
+    if icd is None:
+        libraries = [
+            Path("/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0"),
+            Path("/usr/lib/x86_64-linux-gnu/nvidia/libGLX_nvidia.so.0"),
+        ]
+        library = next((path for path in libraries if path.is_file()), None)
+        if library is None:
+            found = find_library("GLX_nvidia")
+            if found and Path(found).is_file():
+                library = Path(found)
+        if library is not None:
+            VIDEO2X_DIR.mkdir(parents=True, exist_ok=True)
+            icd = VIDEO2X_DIR / "nvidia_icd.json"
+            icd.write_text(
+                '{\n'
+                '  "file_format_version": "1.0.0",\n'
+                '  "ICD": {\n'
+                f'    "library_path": "{library}",\n'
+                '    "api_version": "1.3.0"\n'
+                '  }\n'
+                '}\n',
+                encoding="utf-8",
+            )
+    if icd is not None:
+        env["VK_ICD_FILENAMES"] = str(icd)
+        # Newer Vulkan loaders use VK_DRIVER_FILES; setting both keeps the
+        # code compatible with old and new Ubuntu/Colab loader versions.
+        env["VK_DRIVER_FILES"] = str(icd)
+    return env
 
 def _video2x_vulkan_device(command: list[str], cwd: Path, env: dict[str, str]) -> Optional[int]:
     """List Video2X Vulkan devices and prefer NVIDIA over a software ICD."""
@@ -273,6 +338,9 @@ def _video2x_vulkan_device(command: list[str], cwd: Path, env: dict[str, str]) -
     for index, label in devices:
         if any(token in label for token in ("nvidia", "tesla", "t4", "rtx", "quadro")):
             return index
+    # Never silently run on lavapipe/CPU when the user requested the T4.
+    if any(token in label for _, label in devices for token in ("llvmpipe", "lavapipe", "software", "cpu")):
+        return None
     return devices[0][0]
 
 
@@ -333,7 +401,7 @@ def prepare_video2x(progress: ProgressFn = None) -> str:
 
     appimage = _download_video2x_appimage(progress)
     appimage.chmod(appimage.stat().st_mode | 0o111)
-    env = os.environ.copy()
+    env = _configure_vulkan_environment()
     direct_command = [str(appimage), "--appimage-extract-and-run"]
     if _probe_video2x(direct_command, VIDEO2X_DIR, env):
         device_index = _video2x_vulkan_device(direct_command, VIDEO2X_DIR, env)
