@@ -11,10 +11,12 @@ import gc
 import math
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -742,7 +744,6 @@ def _run_video2x(
         model_name,
         "-d",
         "0",
-        "--no-progress",
         "-c",
         "libx264",
         "-e",
@@ -759,15 +760,58 @@ def _run_video2x(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            bufsize=0,
         )
-        output, _ = process.communicate()
     except OSError as error:
         raise RuntimeError(f"Could not start Video2X: {error}") from error
 
+    # Video2X writes its progress bar with carriage returns instead of normal
+    # newlines. Read the pipe without buffering it until the process exits, so
+    # the Colab cell and Gradio progress indicator both stay informative.
+    output_tail: list[str] = []
+    text_buffer = ""
+    last_cell_print = 0.0
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            events = selector.select(timeout=0.25)
+            if not events:
+                continue
+            for key, _ in events:
+                data = os.read(key.fileobj.fileno(), 8192)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                text_buffer += data.decode("utf-8", errors="replace")
+                parts = re.split(r"[\r\n]", text_buffer)
+                text_buffer = parts.pop()
+                for part in parts:
+                    cleaned = part.strip()
+                    if not cleaned:
+                        continue
+                    output_tail.append(cleaned)
+                    del output_tail[:-20]
+                    match = re.search(r"frame=(\d+)\s*/\s*(\d+)", cleaned)
+                    if match:
+                        processed, total = int(match.group(1)), int(match.group(2))
+                        fraction = 0.15 + 0.80 * (processed / max(total, 1))
+                        _report(progress, fraction, f"Video2X frame {processed}/{total}")
+                    now = time.monotonic()
+                    if now - last_cell_print >= 1.0:
+                        print(f"[Video2X] {cleaned}", flush=True)
+                        last_cell_print = now
+        if text_buffer.strip():
+            output_tail.append(text_buffer.strip())
+    finally:
+        selector.close()
+
+    return_code = process.wait()
     _report(progress, 0.95, "Video2X encoding output")
-    if process.returncode != 0 or not destination.exists() or destination.stat().st_size == 0:
-        details = "\n".join((output or "").splitlines()[-8:])
+    if return_code != 0 or not destination.exists() or destination.stat().st_size == 0:
+        details = "\n".join(output_tail[-8:])
         raise RuntimeError(
             "Video2X failed. Confirm that Colab exposes a Vulkan GPU (the T4 should appear as device 0).\n"
             + details
