@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.request import Request, urlopen
 
+import ctypes
 import cv2
 import numpy as np
 import torch
@@ -83,6 +84,7 @@ VIDEO2X_APPIMAGE_URL = (
 VIDEO2X_DIR = ROOT / "video2x"
 VIDEO2X_APPIMAGE = VIDEO2X_DIR / f"Video2X-{VIDEO2X_VERSION}.AppImage"
 _VIDEO2X_RUNTIME: Optional[tuple[list[str], Path, dict[str, str]]] = None
+_VIDEO2X_DEVICE_INDEX = 0
 
 
 def _model_label(model_key: str) -> str:
@@ -208,6 +210,72 @@ def _download_asset(kind: str) -> Path:
     return destination
 
 
+def _ensure_vulkan_runtime(progress: ProgressFn = None) -> None:
+    """Install the Vulkan loader that is absent from some Colab images."""
+
+    try:
+        ctypes.CDLL("libvulkan.so.1")
+        return
+    except OSError:
+        pass
+
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
+        raise RuntimeError("libvulkan.so.1 is missing and apt-get is unavailable in this runtime.")
+    _report(progress, 0.01, "Installing Vulkan runtime for Video2X")
+    update = subprocess.run(
+        [apt_get, "update", "-qq"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    install = subprocess.run(
+        [apt_get, "install", "-y", "-qq", "libvulkan1", "vulkan-tools", "mesa-vulkan-drivers"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if update.returncode != 0 or install.returncode != 0:
+        details = "\n".join((install.stdout or update.stdout or "").splitlines()[-8:])
+        raise RuntimeError("Could not install the Vulkan runtime in Colab.\n" + details)
+    try:
+        ctypes.CDLL("libvulkan.so.1")
+    except OSError as error:
+        raise RuntimeError("Vulkan loader installation finished, but libvulkan.so.1 is still unavailable.") from error
+
+
+def _video2x_vulkan_device(command: list[str], cwd: Path, env: dict[str, str]) -> Optional[int]:
+    """List Video2X Vulkan devices and prefer NVIDIA over a software ICD."""
+
+    result = subprocess.run(
+        command + ["--list-devices"],
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    output = result.stdout or ""
+    if output.strip():
+        print("[Video2X] Vulkan devices:\n" + output.strip(), flush=True)
+    devices = []
+    for match in re.finditer(r"(?m)^\s*(\d+)[.)]\s*(.+)$", output):
+        devices.append((int(match.group(1)), match.group(2).strip().lower()))
+    if not devices:
+        # Older Video2X builds may not prefix the first device with an index.
+        if "nvidia" in output.lower() or "tesla" in output.lower() or "t4" in output.lower():
+            return 0
+        return None
+    for index, label in devices:
+        if any(token in label for token in ("nvidia", "tesla", "t4", "rtx", "quadro")):
+            return index
+    return devices[0][0]
+
+
 def _download_video2x_appimage(progress: ProgressFn = None) -> Path:
     """Download the official Linux Video2X bundle once per Colab runtime."""
 
@@ -258,7 +326,8 @@ def prepare_video2x(progress: ProgressFn = None) -> str:
     models and libraries, while Colab supplies the NVIDIA Vulkan driver.
     """
 
-    global _VIDEO2X_RUNTIME
+    global _VIDEO2X_RUNTIME, _VIDEO2X_DEVICE_INDEX
+    _ensure_vulkan_runtime(progress)
     if _VIDEO2X_RUNTIME is not None:
         return " ".join(_VIDEO2X_RUNTIME[0])
 
@@ -267,9 +336,12 @@ def prepare_video2x(progress: ProgressFn = None) -> str:
     env = os.environ.copy()
     direct_command = [str(appimage), "--appimage-extract-and-run"]
     if _probe_video2x(direct_command, VIDEO2X_DIR, env):
-        _VIDEO2X_RUNTIME = (direct_command, VIDEO2X_DIR, env)
-        _report(progress, 0.12, "Video2X Vulkan backend ready")
-        return " ".join(direct_command)
+        device_index = _video2x_vulkan_device(direct_command, VIDEO2X_DIR, env)
+        if device_index is not None:
+            _VIDEO2X_DEVICE_INDEX = device_index
+            _VIDEO2X_RUNTIME = (direct_command, VIDEO2X_DIR, env)
+            _report(progress, 0.12, f"Video2X Vulkan backend ready (device {device_index})")
+            return " ".join(direct_command)
 
     # FUSE is not available in some Colab runtimes. Extracting the AppImage
     # uses the same bundled binary without requiring a FUSE mount.
@@ -300,8 +372,14 @@ def prepare_video2x(progress: ProgressFn = None) -> str:
     command = [str(runner)]
     if not _probe_video2x(command, extracted, env):
         raise RuntimeError("Video2X started, but its Vulkan CLI probe failed.")
+    device_index = _video2x_vulkan_device(command, extracted, env)
+    if device_index is None:
+        raise RuntimeError(
+            "Video2X could not find a Vulkan GPU. Install the Vulkan runtime and confirm that the T4 is visible."
+        )
+    _VIDEO2X_DEVICE_INDEX = device_index
     _VIDEO2X_RUNTIME = (command, extracted, env)
-    _report(progress, 0.12, "Video2X Vulkan backend ready (extracted AppImage)")
+    _report(progress, 0.12, f"Video2X Vulkan backend ready (device {device_index})")
     return " ".join(command)
 
 
@@ -743,7 +821,7 @@ def _run_video2x(
         "--realesrgan-model",
         model_name,
         "-d",
-        "0",
+        str(_VIDEO2X_DEVICE_INDEX),
         "-c",
         "libx264",
         "-e",
@@ -855,7 +933,7 @@ def upscale_video(
     frame_text = f" · {total} frames" if total > 0 else ""
     status = (
         f"✅ **Done:** `{source.name}` · {width}×{height} → {width * scale}×{height * scale} · "
-        f"{scale}x · Video2X {VIDEO2X_VERSION} · {model_name} · Vulkan GPU 0{frame_text} · audio preserved"
+        f"{scale}x · Video2X {VIDEO2X_VERSION} · {model_name} · Vulkan GPU {_VIDEO2X_DEVICE_INDEX}{frame_text} · audio preserved"
     )
     return str(destination), status
 
