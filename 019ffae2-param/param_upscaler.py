@@ -86,6 +86,7 @@ VIDEO2X_DIR = ROOT / "video2x"
 VIDEO2X_APPIMAGE = VIDEO2X_DIR / f"Video2X-{VIDEO2X_VERSION}.AppImage"
 _VIDEO2X_RUNTIME: Optional[tuple[list[str], Path, dict[str, str]]] = None
 _VIDEO2X_DEVICE_INDEX = 0
+_VIDEO2X_FAILURE: Optional[str] = None
 _VULKAN_RUNTIME_READY = False
 
 
@@ -464,6 +465,8 @@ def prepare_video2x(progress: ProgressFn = None) -> str:
     """
 
     global _VIDEO2X_RUNTIME, _VIDEO2X_DEVICE_INDEX
+    if _VIDEO2X_FAILURE is not None:
+        raise RuntimeError(_VIDEO2X_FAILURE)
     _ensure_vulkan_runtime(progress)
     if _VIDEO2X_RUNTIME is not None:
         return " ".join(_VIDEO2X_RUNTIME[0])
@@ -1035,28 +1038,155 @@ def _run_video2x(
     return model_name
 
 
-def upscale_video(
+def _upscale_video_cuda(
     input_file: Any,
     scale_choice: Any = "2x",
     model_mode: Any = "Auto (recommended)",
     face_enhance: bool = False,
     tile_size: Any = 512,
     progress: ProgressFn = None,
+    fallback_reason: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Gradio callback for videos using Video2X 6's native Vulkan pipeline."""
+    """CUDA fallback for video when the Video2X Vulkan runtime is unavailable."""
 
     source = _as_path(input_file)
     if source is None:
         raise ValueError("Upload a video first.")
     if source.suffix.lower() not in VIDEO_EXTENSIONS:
         raise ValueError(f"Unsupported video type: {source.suffix or 'unknown'}")
-    if face_enhance:
-        raise ValueError("GFPGAN is not used by Video2X. Turn off face restoration for the fast Video2X path.")
     scale = _scale_value(scale_choice)
-    _tile_value(tile_size)  # Kept in the shared UI; Video2X chooses its own Vulkan tile size.
+    tile = _tile_value(tile_size)
 
-    # Read metadata only for a useful status message; Video2X owns decoding,
-    # frame processing, audio copying, and final encoding.
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise ValueError("Could not open this video. Try MP4 or re-encode the source first.")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise ValueError("The video has no readable frames.")
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30.0
+    target_width, target_height = width * scale, height * scale
+    # A whole 720p/1080p frame is faster than dozens of tiny sequential tiles.
+    # If it does not fit, enhance_bgr automatically retries with safe tiles.
+    video_tile = 0 if tile >= 512 and width * height <= 2_500_000 else tile
+    if video_tile == 0:
+        print(f"[PARAM] Video full-frame mode for {width}×{height}; CUDA OOM will fall back to tiles")
+    destination = _output_path(source, scale, ".mp4")
+    work_dir = Path(tempfile.mkdtemp(prefix="param_upscale_", dir=str(ROOT)))
+    raw_video = work_dir / "silent_upscaled.mp4"
+    writer = None
+    frame_index = 0
+    model_key = resolve_model(model_mode)
+    used_tile = video_tile
+
+    try:
+        writer = cv2.VideoWriter(
+            str(raw_video),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (target_width, target_height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError("Could not create the temporary output video.")
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_index == 0:
+                _report(progress, 0.02, "Loading AI model (first run downloads the checkpoint)")
+            output, model_key, used_tile = enhance_bgr(
+                frame,
+                scale,
+                model_mode,
+                video_tile,
+                bool(face_enhance),
+            )
+            output = _resize_to_target(output, target_width, target_height)
+            writer.write(output)
+            frame_index += 1
+            if total > 0:
+                fraction = 0.05 + 0.88 * (frame_index / total)
+                _report(progress, fraction, f"Upscaling frame {frame_index}/{total}")
+            elif frame_index % 5 == 0:
+                _report(progress, 0.5, f"Upscaling frame {frame_index}")
+
+        if writer is not None:
+            writer.release()
+            writer = None
+        cap.release()
+        if frame_index == 0:
+            raise ValueError("No frames could be read from this video.")
+
+        _report(progress, 0.95, "Encoding MP4 and preserving audio")
+        audio_preserved = _mux_video_audio(raw_video, source, destination)
+        extras = " + GFPGAN face restoration" if face_enhance else ""
+        audio_note = "audio preserved" if audio_preserved else "audio unavailable"
+        device = _device()
+        device_text = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+        backend_note = "CUDA fallback (Video2X Vulkan unavailable)" if fallback_reason else "CUDA PyTorch"
+        status = (
+            f"✅ **Done:** `{source.name}` · {width}×{height} → {target_width}×{target_height} · "
+            f"{scale}x · {frame_index} frames · {_model_label(model_key)}{extras} · {audio_note} · "
+            f"{device_text} · {backend_note}"
+        )
+        _report(progress, 1.0, "Finished")
+        return str(destination), status
+    finally:
+        if writer is not None:
+            writer.release()
+        cap.release()
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+
+def upscale_video(
+    input_file: Any,
+    scale_choice: Any = "2x",
+    model_mode: Any = "Auto (recommended)",
+    face_enhance: bool = False,
+    tile_size: Any = 512,
+    backend_choice: Any = "Auto (Video2X → CUDA)",
+    progress: ProgressFn = None,
+) -> tuple[str, str]:
+    """Gradio callback for videos with Video2X-first hybrid execution.
+
+    The default tries Video2X's official C++/Vulkan runtime. If the current
+    Colab host exposes CUDA but not Vulkan, it automatically falls back to the
+    optimized PyTorch CUDA path so the job still completes in this notebook.
+    """
+
+    global _VIDEO2X_FAILURE
+    source = _as_path(input_file)
+    if source is None:
+        raise ValueError("Upload a video first.")
+    if source.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise ValueError(f"Unsupported video type: {source.suffix or 'unknown'}")
+    scale = _scale_value(scale_choice)
+    backend = str(backend_choice or "Auto (Video2X → CUDA)").lower()
+    if "video2x" in backend and "only" in backend and face_enhance:
+        raise ValueError("Video2X does not use GFPGAN. Turn off face restoration or choose Auto/CUDA backend.")
+
+    if "cuda" in backend and "video2x" not in backend:
+        return _upscale_video_cuda(source, scale, model_mode, bool(face_enhance), tile_size, progress)
+
+    if face_enhance:
+        # Auto mode remains useful with the face toggle: use the CUDA path
+        # rather than silently dropping the requested face restoration.
+        return _upscale_video_cuda(
+            source,
+            scale,
+            model_mode,
+            True,
+            tile_size,
+            progress,
+            fallback_reason="GFPGAN requires the CUDA backend",
+        )
+
     cap = cv2.VideoCapture(str(source))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1066,13 +1196,34 @@ def upscale_video(
         raise ValueError("Could not read the video dimensions. Try MP4 or re-encode the source first.")
 
     destination = _output_path(source, scale, ".mp4")
-    model_name = _run_video2x(source, destination, scale, model_mode, progress)
-    frame_text = f" · {total} frames" if total > 0 else ""
-    status = (
-        f"✅ **Done:** `{source.name}` · {width}×{height} → {width * scale}×{height * scale} · "
-        f"{scale}x · Video2X {VIDEO2X_VERSION} · {model_name} · Vulkan GPU {_VIDEO2X_DEVICE_INDEX}{frame_text} · audio preserved"
-    )
-    return str(destination), status
+    try:
+        model_name = _run_video2x(source, destination, scale, model_mode, progress)
+        frame_text = f" · {total} frames" if total > 0 else ""
+        status = (
+            f"✅ **Done:** `{source.name}` · {width}×{height} → {width * scale}×{height * scale} · "
+            f"{scale}x · Video2X {VIDEO2X_VERSION} · {model_name} · "
+            f"Vulkan GPU {_VIDEO2X_DEVICE_INDEX}{frame_text} · audio preserved"
+        )
+        return str(destination), status
+    except Exception as error:
+        if "only" in backend:
+            raise
+        # Remember the failure so a second Auto job does not repeat a long
+        # AppImage/Vulkan probe in the same runtime.
+        _VIDEO2X_FAILURE = str(error)
+        # Colab can expose CUDA while hiding Vulkan. Do not make the user lose
+        # the job: use the same notebook's optimized CUDA implementation.
+        print(f"[PARAM] Video2X unavailable; switching to CUDA fallback: {error}", flush=True)
+        destination.unlink(missing_ok=True)
+        return _upscale_video_cuda(
+            source,
+            scale,
+            model_mode,
+            False,
+            tile_size,
+            progress,
+            fallback_reason=str(error),
+        )
 
 def build_app() -> Any:
     """Build the Gradio interface without launching it."""
@@ -1087,12 +1238,12 @@ def build_app() -> Any:
     with gr.Blocks(css=css, title="PARAM AI Upscaler") as demo:
         gr.Markdown("# PARAM AI Upscaler", elem_classes=["param-title"])
         gr.Markdown(
-            "T4-friendly image enhancement · Video2X Vulkan video processing · optional GFPGAN faces",
+            "T4-friendly AI image enhancement · Video2X-first video processing · CUDA fallback · optional GFPGAN",
             elem_classes=["param-subtitle"],
         )
         gr.Markdown(
             f"**Runtime:** {system_info()}\n\n"
-            "Images use the Python Real-ESRGAN path. Videos use Video2X 6.4.0 with ncnn/Vulkan and its bundled models. "
+            "Images use the Python Real-ESRGAN path. Videos try Video2X 6.4.0 with ncnn/Vulkan, then use the same notebook's CUDA fallback if Vulkan is unavailable. "
             "Auto is the safe photo choice; choose Anime / illustration for cartoons or line art."
         )
 
@@ -1134,13 +1285,23 @@ def build_app() -> Any:
                 label="Upload video",
                 sources=["upload"],
             )
+            video_backend = gr.Dropdown(
+                [
+                    "Auto (Video2X → CUDA)",
+                    "Video2X Vulkan only",
+                    "CUDA PyTorch (reliable)",
+                ],
+                value="Auto (Video2X → CUDA)",
+                label="Video backend",
+                info="Auto tries Video2X first, then uses CUDA if this Colab has no Vulkan GPU.",
+            )
             video_button = gr.Button("Upscale video", variant="primary")
             video_output = gr.Video(label="Upscaled MP4")
             video_status = gr.Markdown()
             gr.Markdown(
-                f"Video is processed by **Video2X {VIDEO2X_VERSION}** using its C++/Vulkan pipeline. "
-                "For 2x, the bundled `realesr-animevideov3-x2` model is used; for real-world 4x, `realesrgan-plus-x4`. "
-                "Keep the Colab tab open until the output appears."
+                f"Video tries **Video2X {VIDEO2X_VERSION}** (C++/Vulkan) first. "
+                "If Vulkan is unavailable, Auto switches to the optimized CUDA AI fallback in this same notebook. "
+                "For 2x Video2X, the bundled `realesr-animevideov3-x2` model is used. Keep the Colab tab open until the output appears."
             )
 
         # Defining the progress default inside build_app keeps gradio optional
@@ -1148,8 +1309,24 @@ def build_app() -> Any:
         def image_job(input_file, scale_choice, model_mode, face_enhance, tile_size, progress=gr.Progress()):
             return upscale_image(input_file, scale_choice, model_mode, face_enhance, tile_size, progress)
 
-        def video_job(input_file, scale_choice, model_mode, face_enhance, tile_size, progress=gr.Progress()):
-            return upscale_video(input_file, scale_choice, model_mode, face_enhance, tile_size, progress)
+        def video_job(
+            input_file,
+            scale_choice,
+            model_mode,
+            face_enhance,
+            tile_size,
+            backend_choice,
+            progress=gr.Progress(),
+        ):
+            return upscale_video(
+                input_file,
+                scale_choice,
+                model_mode,
+                face_enhance,
+                tile_size,
+                backend_choice,
+                progress,
+            )
 
         common_inputs = [scale, model, face, tile]
         image_button.click(
@@ -1159,7 +1336,7 @@ def build_app() -> Any:
         )
         video_button.click(
             video_job,
-            inputs=[video_input, *common_inputs],
+            inputs=[video_input, *common_inputs, video_backend],
             outputs=[video_output, video_status],
         )
 
